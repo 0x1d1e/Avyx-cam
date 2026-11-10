@@ -10,9 +10,10 @@ No Android app installation required. Uses native Android ADB media streaming vi
 
 - **Zero Phone App**: No third-party apps required on your phone. Works over native Android developer debugging.
 - **Wireless QR Pairing**: Pair phone and laptop over Wi-Fi without ever plugging in a cable (Android 11+).
-- **Auto-Rotate Stream**: Automatically syncs camera rotation with physical phone orientation.
-- **Saved Devices & Auto-Reconnect**: Remembers previous phones and Wi-Fi endpoints for 1-click reconnect.
-- **High Frame Rates**: Up to 120 fps / 240 fps high-speed modes on supported back camera sensors.
+- **Auto-Rotate Stream**: Checks Android display orientation and restarts the stream when rotation changes.
+- **Saved Devices & Auto-Reconnect**: Remembers phones and Wi-Fi endpoints. Automatic retries honor the Auto-reconnect setting and Stop button; saved Wi-Fi retries use remembered addresses.
+- **Battery Monitoring**: Shows the selected phone's battery percentage, charging state, and battery temperature. Refreshes about every 20 seconds; missing data does not prevent streaming.
+- **High Frame Rates**: The GUI offers up to 120 fps on supported back cameras. Available modes and delivered frame rates depend on the phone.
 - **PipeWire Virtual Microphone**: Low-latency `PhoneMic` source selectable in Zoom, Google Meet, Discord, and OBS.
 - **Full Lens & Hardware Controls**: Front/back switch, zoom slider, flashlight/torch, flip/un-mirror, bitrate, and v4l2 buffering.
 - **Background Mode**: Disable live preview window to run purely as a headless system webcam.
@@ -91,6 +92,22 @@ avyx-cam --help          # Show CLI options
 ```
 
 ---
+
+## Development
+
+```bash
+cargo test
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+```
+
+The optional GUI smoke test uses simulated Android and streaming commands. It requires a graphical session, `/dev/video0`, and no active webcam stream:
+
+```bash
+cargo test gui_smoke -- --ignored --test-threads=1
+```
+
+See [optimization scope](docs/optimization-plan.md) for planned milestones and validation criteria. Battery temperature comes from Android's battery service; it does not measure camera or CPU temperature. Monitoring is read-only and does not control charging or stream quality.
 
 ## Architecture
 

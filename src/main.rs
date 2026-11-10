@@ -1,16 +1,19 @@
+mod battery;
 mod config;
 mod devices;
+#[cfg(test)]
+mod gui_tests;
 mod qr;
 mod stream;
 mod ui;
 
+use config::{load_config, save_config};
+use devices::{list_adb_devices, switch_usb_to_wifi, video_exists, VIDEO_DEV};
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
-use config::{load_config, save_config};
-use devices::{list_adb_devices, switch_usb_to_wifi, video_exists, VIDEO_DEV};
-use stream::{read_external_pid, start_scrcpy, stop_all_streams};
 use std::env;
+use stream::{read_external_pid, start_scrcpy, stop_all_streams};
 
 fn print_usage() {
     println!(
@@ -48,7 +51,12 @@ fn handle_cli(cmd: &str) -> i32 {
             let devs = list_adb_devices();
             println!("Phones connected: {}", devs.len());
             for d in devs {
-                println!("  - {} [{}] ({})", d.model, d.state, if d.is_wifi { "Wi-Fi" } else { "USB" });
+                println!(
+                    "  - {} [{}] ({})",
+                    d.model,
+                    d.state,
+                    if d.is_wifi { "Wi-Fi" } else { "USB" }
+                );
             }
             0
         }
@@ -76,7 +84,11 @@ fn handle_cli(cmd: &str) -> i32 {
         }
         "front" | "back" => {
             let mut cfg = load_config();
-            cfg.camera_id = if cmd == "front" { "1".to_string() } else { "0".to_string() };
+            cfg.camera_id = if cmd == "front" {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            };
             save_config(&cfg);
 
             let devs = list_adb_devices();
@@ -86,10 +98,17 @@ fn handle_cli(cmd: &str) -> i32 {
                 return 1;
             };
 
-            println!("Starting {} camera on {}...", if cmd == "front" { "front" } else { "back" }, d.model);
+            println!(
+                "Starting {} camera on {}...",
+                if cmd == "front" { "front" } else { "back" },
+                d.model
+            );
             match start_scrcpy(&d.serial, &cfg, None, false) {
                 Ok(handle) => {
-                    println!("Started! Streaming to {VIDEO_DEV} (PID {})", handle.child.id());
+                    println!(
+                        "Started! Streaming to {VIDEO_DEV} (PID {})",
+                        handle.child.id()
+                    );
                     0
                 }
                 Err(e) => {
