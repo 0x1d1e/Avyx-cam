@@ -464,4 +464,50 @@ mod tests {
         assert_eq!(res, None);
         assert_eq!(checks, 1);
     }
+
+    #[test]
+    fn aborts_subsequent_attempts_after_mid_flight_cancel() {
+        let history = vec![
+            crate::config::DeviceHistory {
+                serial: "192.0.2.1:5555".into(),
+                model: "Phone 1".into(),
+                address: "192.0.2.1:5555".into(),
+                is_wifi: true,
+                last_seen: "test".into(),
+                camera_id: "0".into(),
+                resolution: "1280x720".into(),
+                fps: "30".into(),
+            },
+            crate::config::DeviceHistory {
+                serial: "192.0.2.2:5555".into(),
+                model: "Phone 2".into(),
+                address: "192.0.2.2:5555".into(),
+                is_wifi: true,
+                last_seen: "test".into(),
+                camera_id: "0".into(),
+                resolution: "1280x720".into(),
+                fps: "30".into(),
+            },
+            crate::config::DeviceHistory {
+                serial: "192.0.2.3:5555".into(),
+                model: "Phone 3".into(),
+                address: "192.0.2.3:5555".into(),
+                is_wifi: true,
+                last_seen: "test".into(),
+                camera_id: "0".into(),
+                resolution: "1280x720".into(),
+                fps: "30".into(),
+            },
+        ];
+        let mut attempts = 0;
+        // First check succeeds; mid-flight cancel triggers before second check.
+        let res = try_auto_reconnect_history(&history, || {
+            attempts += 1;
+            attempts <= 1
+        });
+        assert_eq!(res, None);
+        // Checked once before phone 1 (allowed), once before phone 2 (cancelled -> abort).
+        // Phone 3 is never examined.
+        assert_eq!(attempts, 2);
+    }
 }

@@ -1162,9 +1162,11 @@ pub fn build_ui(app: &adw::Application) {
         let state = state.clone();
         let launch_stream = launch_stream.clone();
         let sync_ui = sync_ui.clone();
+        let reconnect_cancel = reconnect_cancel.clone();
         move |_| {
             let live = state.borrow().stream.is_some() || read_external_pid().is_some();
             if live {
+                reconnect_cancel.store(true, Ordering::Relaxed);
                 {
                     let mut st = state.borrow_mut();
                     st.user_stopped = true;
@@ -1493,9 +1495,14 @@ pub fn build_ui(app: &adw::Application) {
     auto_reconn_row.connect_active_notify({
         let state = state.clone();
         let updating_ui = updating_ui.clone();
+        let reconnect_cancel = reconnect_cancel.clone();
         move |row| {
             if !updating_ui.get() {
-                state.borrow_mut().cfg.auto_reconnect = row.is_active();
+                let active = row.is_active();
+                if !active {
+                    reconnect_cancel.store(true, Ordering::Relaxed);
+                }
+                state.borrow_mut().cfg.auto_reconnect = active;
                 save_config(&state.borrow().cfg);
             }
         }
