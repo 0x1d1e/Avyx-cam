@@ -29,7 +29,8 @@ Milestones are ordered by dependency. Each gets a separate issue and PR when imp
 - Give queries a five-second deadline, terminate and reap a timed-out child, and bound captured output.
 - Clear stale readings on disconnect or selection changes; discard results for a previous selection. Missing/invalid fields remain unavailable.
 - Keep monitoring read-only. No charging limits, screen changes, quality changes, automatic shutdown, or temperature-based interventions.
-- Stop remains effective until the user explicitly starts again during this app session. Saved-device retries require Auto-reconnect enabled.
+- Stop remains effective until the user explicitly starts again during this app session. Saved-device retries require Auto-reconnect enabled, no ready/authorized phone currently present, and at most one in-flight retry worker.
+- Each `adb connect` attempt has an explicit five-second timeout; retrying through saved addresses aborts if Auto-reconnect is turned off, Stop is pressed, a phone connects, or a stream starts.
 - Remembered-address retries do not connect to arbitrary mDNS advertisements. Reliable discovery across changing ports belongs to milestone 3.
 
 ### Design decisions

@@ -213,12 +213,46 @@ pub fn switch_usb_to_wifi(usb_serial: &str, port: u16) -> Result<String, String>
 }
 
 pub fn connect_wifi(endpoint: &str) -> Result<String, String> {
+    connect_wifi_timeout(endpoint, std::time::Duration::from_secs(5))
+}
+
+pub fn connect_wifi_timeout(
+    endpoint: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
     let ep = if endpoint.contains(':') {
         endpoint.trim().to_string()
     } else {
         format!("{}:5555", endpoint.trim())
     };
-    let out = run_out("adb", &["connect", &ep])?;
+    let mut child = Command::new("adb")
+        .args(["connect", &ep])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Connect error: {e}"))?;
+    let started = std::time::Instant::now();
+    let out = loop {
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Connect timed out".into());
+        }
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            let output = child.wait_with_output().map_err(|e| e.to_string())?;
+            if !status.success() {
+                let err = String::from_utf8_lossy(&output.stderr);
+                return Err(if err.trim().is_empty() {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                } else {
+                    err.trim().to_string()
+                });
+            }
+            break String::from_utf8_lossy(&output.stdout).to_string();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     if out.to_lowercase().contains("connected") {
         Ok(ep)
     } else {
@@ -372,10 +406,19 @@ pub fn optimal_camera_rotation(camera_id: &str, surface_deg: u32) -> &'static st
     }
 }
 
-pub fn try_auto_reconnect_history(history: &[crate::config::DeviceHistory]) -> Option<String> {
+pub fn try_auto_reconnect_history<F>(
+    history: &[crate::config::DeviceHistory],
+    mut should_continue: F,
+) -> Option<String>
+where
+    F: FnMut() -> bool,
+{
     // A discovered service is not sufficient evidence that this is a remembered phone.
     // Until stable device identity is available, only retry saved endpoints.
     for item in history {
+        if !should_continue() {
+            return None;
+        }
         if item.is_wifi && !item.address.is_empty() {
             if let Ok(connected) = connect_wifi(&item.address) {
                 return Some(connected);
@@ -383,4 +426,42 @@ pub fn try_auto_reconnect_history(history: &[crate::config::DeviceHistory]) -> O
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stops_when_should_continue_becomes_false() {
+        let history = vec![
+            crate::config::DeviceHistory {
+                serial: "192.0.2.1:5555".into(),
+                model: "Phone 1".into(),
+                address: "192.0.2.1:5555".into(),
+                is_wifi: true,
+                last_seen: "test".into(),
+                camera_id: "0".into(),
+                resolution: "1280x720".into(),
+                fps: "30".into(),
+            },
+            crate::config::DeviceHistory {
+                serial: "192.0.2.2:5555".into(),
+                model: "Phone 2".into(),
+                address: "192.0.2.2:5555".into(),
+                is_wifi: true,
+                last_seen: "test".into(),
+                camera_id: "0".into(),
+                resolution: "1280x720".into(),
+                fps: "30".into(),
+            },
+        ];
+        let mut checks = 0;
+        let res = try_auto_reconnect_history(&history, || {
+            checks += 1;
+            false
+        });
+        assert_eq!(res, None);
+        assert_eq!(checks, 1);
+    }
 }

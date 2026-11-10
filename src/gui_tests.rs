@@ -59,7 +59,11 @@ printf '%s\n' "$*" >> "$AVYX_GUI_FIXTURE/adb.log"
 case "$*" in
   'devices -l')
     printf 'List of devices attached\n'
-    if [ -f "$AVYX_GUI_FIXTURE/connected" ]; then printf '192.0.2.1:5555 device model:Test_phone\n'; fi ;;
+    if [ -f "$AVYX_GUI_FIXTURE/connected" ]; then
+      printf '192.0.2.1:5555 device model:Test_phone\n'
+    elif [ -f "$AVYX_GUI_FIXTURE/offline" ]; then
+      printf '192.0.2.1:5555 offline model:Test_phone\n'
+    fi ;;
   *'shell dumpsys battery')
     sleep 2
     printf 'level: 83\nscale: 100\nstatus: 2\ntemperature: 327\n' ;;
@@ -128,8 +132,9 @@ esac
         .unwrap()
         .contains("connect "));
     assert!(battery.subtitle().unwrap().contains("Connect a phone"));
+    fs::write(root.join("offline"), "").unwrap();
     reconnect.set_active(true);
-    pump(1.3);
+    pump(2.0);
     assert!(fs::read_to_string(root.join("adb.log"))
         .unwrap()
         .contains("connect 192.0.2.1:5555"));

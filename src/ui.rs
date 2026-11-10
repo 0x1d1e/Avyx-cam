@@ -81,6 +81,9 @@ pub fn build_ui(app: &adw::Application) {
     let poll_tick_holder: PollCallback = Rc::new(RefCell::new(None));
     let history_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
 
+    let reconnect_cancel = Arc::new(AtomicBool::new(false));
+    let reconnect_in_flight = Arc::new(AtomicBool::new(false));
+
     let _ = ensure_virtual_mic();
 
     let toast_overlay = adw::ToastOverlay::new();
@@ -844,6 +847,8 @@ pub fn build_ui(app: &adw::Application) {
         let sync_ui = sync_ui.clone();
         let refresh_fps_model = refresh_fps_model.clone();
         let show_toast = show_toast.clone();
+        let reconnect_cancel = reconnect_cancel.clone();
+        let reconnect_in_flight = reconnect_in_flight.clone();
         move || {
             let devs = list_adb_devices();
             let mut should_auto_start = false;
@@ -898,10 +903,21 @@ pub fn build_ui(app: &adw::Application) {
                 }
 
                 // Auto-reconnect to remembered devices if idle
+                let has_ready_device = st.devices.iter().any(|d| d.state == "device");
+                if st.user_stopped
+                    || !st.cfg.auto_reconnect
+                    || has_ready_device
+                    || st.stream.is_some()
+                {
+                    reconnect_cancel.store(true, Ordering::Relaxed);
+                } else {
+                    reconnect_cancel.store(false, Ordering::Relaxed);
+                }
                 if st.cfg.auto_reconnect
-                    && st.devices.is_empty()
+                    && !has_ready_device
                     && st.stream.is_none()
                     && !st.user_stopped
+                    && !reconnect_in_flight.load(Ordering::Relaxed)
                 {
                     let now = Instant::now();
                     let should_check = match st.last_history_reconnect_attempt {
@@ -910,9 +926,15 @@ pub fn build_ui(app: &adw::Application) {
                     };
                     if should_check {
                         st.last_history_reconnect_attempt = Some(now);
+                        reconnect_in_flight.store(true, Ordering::Relaxed);
                         let hist = st.cfg.history.clone();
+                        let cancel = reconnect_cancel.clone();
+                        let in_flight = reconnect_in_flight.clone();
                         thread::spawn(move || {
-                            let _ = try_auto_reconnect_history(&hist);
+                            let _ = try_auto_reconnect_history(&hist, || {
+                                !cancel.load(Ordering::Relaxed)
+                            });
+                            in_flight.store(false, Ordering::Relaxed);
                         });
                     }
                 }
