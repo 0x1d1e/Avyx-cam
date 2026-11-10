@@ -1,0 +1,117 @@
+# Avyx-cam
+
+Native Linux desktop application built with Rust, GTK4, and Libadwaita to turn your Android phone into a high-performance webcam and virtual microphone.
+
+No Android app installation required. Uses native Android ADB media streaming via `scrcpy`, `v4l2loopback`, and `PipeWire`.
+
+---
+
+## Features
+
+- **Zero Phone App**: No third-party apps required on your phone. Works over native Android developer debugging.
+- **Wireless QR Pairing**: Pair phone and laptop over Wi-Fi without ever plugging in a cable (Android 11+).
+- **Auto-Rotate Stream**: Automatically syncs camera rotation with physical phone orientation.
+- **Saved Devices & Auto-Reconnect**: Remembers previous phones and Wi-Fi endpoints for 1-click reconnect.
+- **High Frame Rates**: Up to 120 fps / 240 fps high-speed modes on supported back camera sensors.
+- **PipeWire Virtual Microphone**: Low-latency `PhoneMic` source selectable in Zoom, Google Meet, Discord, and OBS.
+- **Full Lens & Hardware Controls**: Front/back switch, zoom slider, flashlight/torch, flip/un-mirror, bitrate, and v4l2 buffering.
+- **Background Mode**: Disable live preview window to run purely as a headless system webcam.
+- **CLI & GUI Modes**: Control completely through the GTK4 GUI or use command-line shortcuts (`avyx-cam back`, `avyx-cam stop`).
+
+---
+
+## Requirements
+
+### Linux System Dependencies
+
+- **scrcpy** (>= 2.0 recommended)
+- **android-tools** (`adb`)
+- **v4l2loopback** kernel module
+- **pipewire** / **pipewire-pulse**
+- **libadwaita-1** & **gtk4**
+
+#### Arch Linux / Manjaro
+```bash
+sudo pacman -S scrcpy android-tools v4l2loopback-dkms libadwaita gtk4 qrencode
+```
+
+#### Ubuntu / Debian / Fedora
+```bash
+# Ubuntu / Debian
+sudo apt install scrcpy adb v4l2loopback-dkms libadwaita-1-dev libgtk-4-dev qrencode
+
+# Fedora
+sudo dnf install scrcpy android-tools v4l2loopback libadwaita-devel gtk4-devel qrencode
+```
+
+---
+
+## Setup & First Run
+
+1. **Load Virtual Camera Device**:
+   ```bash
+   sudo modprobe v4l2loopback devices=1 video_nr=0 card_label="AvyxCam" exclusive_caps=1
+   ```
+   *(Or click "Install" in Avyx-cam System tab to make it load automatically on boot).*
+
+2. **Run Avyx-cam**:
+   ```bash
+   cargo run --release
+   ```
+   Or install to `~/.local/bin`:
+   ```bash
+   cargo build --release
+   cp target/release/avyx-cam ~/.local/bin/avyx-cam
+   ```
+
+---
+
+## Connecting Your Phone
+
+See the complete **[Connection Guide](docs/connection.md)** for detailed walkthroughs:
+
+- **Wireless QR Pairing**: Go to *Connect* -> *Show QR Code*. On phone: *Developer options* -> *Wireless debugging* -> *Pair device with QR code*.
+- **One-Click Wi-Fi**: Plug USB -> Click *Switch to Wi-Fi* -> Unplug USB.
+- **Direct USB**: Plug phone in -> Tap *Allow USB debugging*.
+
+---
+
+## Command Line Interface (CLI)
+
+Avyx-cam includes CLI commands for scripting and keyboard shortcuts:
+
+```bash
+avyx-cam                 # Launch GTK4 control center
+avyx-cam back            # Start back camera stream
+avyx-cam front           # Start front camera stream
+avyx-cam stop            # Stop all active streams
+avyx-cam wifi            # Switch plugged USB phone to Wi-Fi
+avyx-cam status          # Show stream and device status
+avyx-cam --help          # Show CLI options
+```
+
+---
+
+## Architecture
+
+```
+ Android Phone (Camera2 / Audio API)
+               │
+          ADB (USB or Wi-Fi)
+               │
+          scrcpy engine
+         ┌─────┴─────┐
+         ▼           ▼
+   /dev/video0    PipeWire
+    (AvyxCam)    (PhoneMic)
+         │           │
+         ▼           ▼
+   Webcam Apps   Voice / VoIP
+(Zoom, OBS, etc)
+```
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
