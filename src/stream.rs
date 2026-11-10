@@ -68,7 +68,9 @@ pub fn read_external_pid() -> Option<u32> {
 
 pub fn stop_all_streams() {
     if let Some(pid) = read_external_pid() {
-        let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
     }
     let _ = Command::new("pkill")
         .args(["-f", &format!("scrcpy.*--v4l2-sink={VIDEO_DEV}")])
@@ -141,7 +143,9 @@ pub fn start_scrcpy(
     }
 
     let log_out = File::create(LOG_FILE).map_err(|e| format!("Log file error: {e}"))?;
-    let log_err = log_out.try_clone().map_err(|e| format!("Log clone error: {e}"))?;
+    let log_err = log_out
+        .try_clone()
+        .map_err(|e| format!("Log clone error: {e}"))?;
 
     let child = Command::new("scrcpy")
         .args(&args)

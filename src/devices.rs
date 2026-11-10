@@ -34,7 +34,11 @@ pub fn run_out(cmd: &str, args: &[&str]) -> Result<String, String> {
     if out.status.success() {
         Ok(stdout)
     } else {
-        Err(if stderr.trim().is_empty() { stdout } else { stderr })
+        Err(if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        })
     }
 }
 
@@ -286,7 +290,11 @@ pub fn get_device_orientation(serial: &str) -> Option<u32> {
     if let Ok(out) = run_out("adb", &["-s", serial, "shell", "dumpsys", "input"]) {
         for line in out.lines() {
             if line.contains("SurfaceOrientation") {
-                if let Some(val) = line.split(':').nth(1).and_then(|v| v.trim().parse::<u32>().ok()) {
+                if let Some(val) = line
+                    .split(':')
+                    .nth(1)
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                {
                     return match val {
                         1 => Some(90),
                         2 => Some(180),
@@ -319,7 +327,15 @@ pub fn get_device_orientation(serial: &str) -> Option<u32> {
     // 3. Try settings get system user_rotation
     if let Ok(out) = run_out(
         "adb",
-        &["-s", serial, "shell", "settings", "get", "system", "user_rotation"],
+        &[
+            "-s",
+            serial,
+            "shell",
+            "settings",
+            "get",
+            "system",
+            "user_rotation",
+        ],
     ) {
         if let Ok(val) = out.trim().parse::<u32>() {
             return match val {
@@ -357,21 +373,8 @@ pub fn optimal_camera_rotation(camera_id: &str, surface_deg: u32) -> &'static st
 }
 
 pub fn try_auto_reconnect_history(history: &[crate::config::DeviceHistory]) -> Option<String> {
-    // 1. Check if adb mdns discovered any connect service
-    if let Ok(out) = Command::new("adb").args(["mdns", "services"]).output() {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 && parts[1].to_lowercase().contains("connect") {
-                let ep = parts[2];
-                if let Ok(connected) = connect_wifi(ep) {
-                    return Some(connected);
-                }
-            }
-        }
-    }
-
-    // 2. Try saved wifi addresses in history
+    // A discovered service is not sufficient evidence that this is a remembered phone.
+    // Until stable device identity is available, only retry saved endpoints.
     for item in history {
         if item.is_wifi && !item.address.is_empty() {
             if let Ok(connected) = connect_wifi(&item.address) {

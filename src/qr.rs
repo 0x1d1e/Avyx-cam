@@ -135,10 +135,17 @@ where
 
         // 2. Check mdns-sd crate channel fallback
         if let Some(rx) = &pair_rx {
-            if let Ok(ServiceEvent::ServiceResolved(info)) = rx.recv_timeout(Duration::from_millis(250)) {
+            if let Ok(ServiceEvent::ServiceResolved(info)) =
+                rx.recv_timeout(Duration::from_millis(250))
+            {
                 let fullname = info.get_fullname();
                 if fullname.contains(&service_name) {
-                    if let Some(ip) = info.get_addresses_v4().into_iter().next().map(|a| a.to_string()) {
+                    if let Some(ip) = info
+                        .get_addresses_v4()
+                        .into_iter()
+                        .next()
+                        .map(|a| a.to_string())
+                    {
                         let port = info.get_port();
                         let addr = format!("{ip}:{port}");
                         on_status(&format!("Pairing with {addr}..."));
@@ -152,7 +159,9 @@ where
                             String::from_utf8_lossy(&out.stdout),
                             String::from_utf8_lossy(&out.stderr)
                         );
-                        if out.status.success() && txt.to_lowercase().contains("successfully paired") {
+                        if out.status.success()
+                            && txt.to_lowercase().contains("successfully paired")
+                        {
                             paired_ip = Some(ip);
                             break;
                         }
@@ -212,7 +221,9 @@ where
 
         // 2. Check mdns-sd crate
         if let Some(rx) = &conn_rx {
-            if let Ok(ServiceEvent::ServiceResolved(info)) = rx.recv_timeout(Duration::from_millis(250)) {
+            if let Ok(ServiceEvent::ServiceResolved(info)) =
+                rx.recv_timeout(Duration::from_millis(250))
+            {
                 let matches_ip = info
                     .get_addresses_v4()
                     .into_iter()
@@ -245,9 +256,15 @@ where
 
     // Fallback: try connecting on default port 5555
     let fallback_addr = format!("{target_ip}:5555");
-    let out = Command::new("adb").args(["connect", &fallback_addr]).output();
+    let out = Command::new("adb")
+        .args(["connect", &fallback_addr])
+        .output();
     if let Ok(o) = out {
-        let txt = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let txt = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
         if txt.to_lowercase().contains("connected") {
             if let Some(d) = mdns {
                 let _ = d.shutdown();

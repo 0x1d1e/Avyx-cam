@@ -1,3 +1,4 @@
+use crate::battery::{query_battery, BatteryStatus};
 use crate::config::{load_config, save_config, AppConfig};
 use crate::devices::{
     boot_persistence_installed, connect_wifi, disconnect_wifi, ensure_virtual_mic,
@@ -12,8 +13,8 @@ use crate::stream::{
 };
 use adw::prelude::*;
 use gtk4::prelude::*;
-use libadwaita as adw;
 use gtk4::{gio, glib};
+use libadwaita as adw;
 use qrcode::QrCode;
 use std::cell::{Cell, RefCell};
 use std::process::Command;
@@ -38,10 +39,12 @@ struct AppState {
     last_history_reconnect_attempt: Option<Instant>,
 }
 
+type PollCallback = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
 const RESOLUTIONS: &[&str] = &["1280x720", "1920x1080", "2560x1440", "640x480"];
 const ROTATIONS: &[(&str, &str)] = &[("0°", "0"), ("90°", "90"), ("180°", "180"), ("270°", "270")];
 const MIC_MODES: &[(&str, &str)] = &[
-    ("Voice-tuned (Recommended)", "voice"),
+    ("Voice (Recommended)", "voice"),
     ("Raw Microphone", "raw"),
     ("Camcorder", "camcorder"),
     ("Off (Camera only)", "off"),
@@ -52,7 +55,11 @@ const BITRATES: &[(&str, &str)] = &[
     ("16 Mbps", "16M"),
     ("24 Mbps", "24M"),
 ];
-const BUFFERS: &[(&str, &str)] = &[("0 ms (Low latency)", "0"), ("30 ms", "30"), ("50 ms", "50")];
+const BUFFERS: &[(&str, &str)] = &[
+    ("0 ms (Low latency)", "0"),
+    ("30 ms", "30"),
+    ("50 ms", "50"),
+];
 
 pub fn build_ui(app: &adw::Application) {
     let updating_ui = Rc::new(Cell::new(false));
@@ -71,7 +78,7 @@ pub fn build_ui(app: &adw::Application) {
         last_history_reconnect_attempt: None,
     }));
 
-    let poll_tick_holder: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let poll_tick_holder: PollCallback = Rc::new(RefCell::new(None));
     let history_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
 
     let _ = ensure_virtual_mic();
@@ -127,6 +134,15 @@ pub fn build_ui(app: &adw::Application) {
     warning_row.add_suffix(&fix_v4l2_inline_btn);
     status_group.add(&warning_row);
     cam_page.add(&status_group);
+
+    let battery_group = adw::PreferencesGroup::new();
+    let battery_row = adw::ActionRow::builder()
+        .title("Phone Battery")
+        .subtitle("Connect a phone to view battery status")
+        .subtitle_lines(2)
+        .build();
+    battery_group.add(&battery_row);
+    cam_page.add(&battery_group);
 
     let video_group = adw::PreferencesGroup::builder().title("Video").build();
 
@@ -207,7 +223,7 @@ pub fn build_ui(app: &adw::Application) {
     // Zoom Scale Row
     let zoom_row = adw::ActionRow::builder()
         .title("Zoom")
-        .subtitle(&format!("{:.1}x", state.borrow().cfg.zoom))
+        .subtitle(format!("{:.1}x", state.borrow().cfg.zoom))
         .build();
     let zoom_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 1.0, 8.0, 0.5);
     zoom_scale.set_width_request(170);
@@ -288,9 +304,7 @@ pub fn build_ui(app: &adw::Application) {
 
     // ---------------- TAB 2: CONNECT ----------------
     let conn_page = adw::PreferencesPage::new();
-    let dev_group = adw::PreferencesGroup::builder()
-        .title("Devices")
-        .build();
+    let dev_group = adw::PreferencesGroup::builder().title("Devices").build();
 
     let dev_model = gtk4::StringList::new(&[]);
     let dev_row = adw::ComboRow::builder()
@@ -425,8 +439,18 @@ pub fn build_ui(app: &adw::Application) {
     sys_page.add(&log_group);
 
     stack.add_titled_with_icon(&cam_page, Some("camera"), "Camera", "camera-web-symbolic");
-    stack.add_titled_with_icon(&conn_page, Some("connect"), "Connect", "network-wireless-symbolic");
-    stack.add_titled_with_icon(&sys_page, Some("system"), "System", "emblem-system-symbolic");
+    stack.add_titled_with_icon(
+        &conn_page,
+        Some("connect"),
+        "Connect",
+        "network-wireless-symbolic",
+    );
+    stack.add_titled_with_icon(
+        &sys_page,
+        Some("system"),
+        "System",
+        "emblem-system-symbolic",
+    );
 
     // Populate FPS options based on lens
     let refresh_fps_model = {
@@ -548,7 +572,12 @@ pub fn build_ui(app: &adw::Application) {
             }
             let (devices, selected_serial, stream_active, cfg) = {
                 let st = state.borrow();
-                (st.devices.clone(), st.selected_serial.clone(), st.stream.is_some(), st.cfg.clone())
+                (
+                    st.devices.clone(),
+                    st.selected_serial.clone(),
+                    st.stream.is_some(),
+                    st.cfg.clone(),
+                )
             };
 
             for d in &devices {
@@ -585,8 +614,16 @@ pub fn build_ui(app: &adw::Application) {
             // Status row + Start/Stop button
             if is_live {
                 status_row.set_title("Camera &amp; Mic Live");
-                let lens_name = if cfg.camera_id == "1" { "Front" } else { "Back" };
-                let mic_name = if cfg.mic_mode == "off" { "Mic Off" } else { "PhoneMic" };
+                let lens_name = if cfg.camera_id == "1" {
+                    "Front"
+                } else {
+                    "Back"
+                };
+                let mic_name = if cfg.mic_mode == "off" {
+                    "Mic Off"
+                } else {
+                    "PhoneMic"
+                };
                 status_row.set_subtitle(&format!(
                     "{lens_name} • {} @ {} fps • {mic_name}",
                     cfg.resolution, cfg.fps
@@ -633,7 +670,8 @@ pub fn build_ui(app: &adw::Application) {
                 warning_row.set_visible(true);
             } else if !busy.is_empty() {
                 warning_row.set_title(&format!("{} is using /dev/video0", busy.join(", ")));
-                warning_row.set_subtitle("Close it there if changing resolution produces a green screen");
+                warning_row
+                    .set_subtitle("Close it there if changing resolution produces a green screen");
                 fix_v4l2_inline_btn.set_visible(false);
                 warning_row.set_visible(true);
             } else {
@@ -714,7 +752,7 @@ pub fn build_ui(app: &adw::Application) {
                     });
                     let row = adw::ActionRow::builder()
                         .title(&dev.model)
-                        .subtitle(&format!(
+                        .subtitle(format!(
                             "{} • Last seen {}",
                             if dev.address.is_empty() {
                                 &dev.serial
@@ -836,7 +874,10 @@ pub fn build_ui(app: &adw::Application) {
                 // Phone auto-rotate sync
                 if st.cfg.auto_rotate {
                     if let Some(ser) = st.selected_serial.clone() {
-                        let is_ready = st.devices.iter().any(|d| d.serial == ser && d.state == "device");
+                        let is_ready = st
+                            .devices
+                            .iter()
+                            .any(|d| d.serial == ser && d.state == "device");
                         if is_ready {
                             if let Some(deg) = get_device_orientation(&ser) {
                                 let prev = st.last_detected_orientation;
@@ -857,7 +898,11 @@ pub fn build_ui(app: &adw::Application) {
                 }
 
                 // Auto-reconnect to remembered devices if idle
-                if st.devices.is_empty() && st.stream.is_none() && !st.user_stopped {
+                if st.cfg.auto_reconnect
+                    && st.devices.is_empty()
+                    && st.stream.is_none()
+                    && !st.user_stopped
+                {
                     let now = Instant::now();
                     let should_check = match st.last_history_reconnect_attempt {
                         None => true,
@@ -889,7 +934,10 @@ pub fn build_ui(app: &adw::Application) {
                 // Probe cameras once per connected phone
                 if let Some(sel) = st.selected_serial.clone() {
                     if st.probed_serial.as_deref() != Some(sel.as_str())
-                        && st.devices.iter().any(|d| d.serial == sel && d.state == "device")
+                        && st
+                            .devices
+                            .iter()
+                            .any(|d| d.serial == sel && d.state == "device")
                     {
                         st.probed_serial = Some(sel.clone());
                         probe_target = Some(sel);
@@ -917,7 +965,6 @@ pub fn build_ui(app: &adw::Application) {
                     st.last_usb_seen = true;
                 } else {
                     st.last_usb_seen = false;
-                    st.user_stopped = false;
                 }
 
                 // Supervise active stream
@@ -953,7 +1000,11 @@ pub fn build_ui(app: &adw::Application) {
                 }
 
                 if let Some(at) = st.reconnect_at {
-                    if Instant::now() >= at && st.stream.is_none() && !st.user_stopped {
+                    if st.cfg.auto_reconnect
+                        && Instant::now() >= at
+                        && st.stream.is_none()
+                        && !st.user_stopped
+                    {
                         st.reconnect_at = None;
                         crash_retry = Some((None, false));
                     }
@@ -987,6 +1038,78 @@ pub fn build_ui(app: &adw::Application) {
         let poll_tick = poll_tick.clone();
         move || {
             poll_tick();
+            glib::ControlFlow::Continue
+        }
+    });
+
+    // Battery queries have a separate cadence and never run on the GTK thread.
+    let mut battery_selection: Option<String> = None;
+    let mut battery_generation = 0_u64;
+    let mut last_battery_query: Option<Instant> = None;
+    let mut pending_battery: Option<(u64, mpsc::Receiver<Result<BatteryStatus, String>>)> = None;
+    glib::timeout_add_local(Duration::from_millis(250), {
+        let state = state.clone();
+        let window = window.downgrade();
+        move || {
+            if window.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
+            let selected = {
+                let st = state.borrow();
+                st.selected_serial
+                    .as_ref()
+                    .filter(|serial| {
+                        st.devices
+                            .iter()
+                            .any(|d| &d.serial == *serial && d.state == "device")
+                    })
+                    .cloned()
+            };
+            if selected != battery_selection {
+                battery_selection = selected;
+                battery_generation = battery_generation.wrapping_add(1);
+                last_battery_query = None;
+                battery_row.set_subtitle(if battery_selection.is_some() {
+                    "Reading phone battery…"
+                } else {
+                    "Connect a phone to view battery status"
+                });
+            }
+            if let Some((generation, receiver)) = &pending_battery {
+                match receiver.try_recv() {
+                    Ok(result) => {
+                        if *generation == battery_generation {
+                            match result {
+                                Ok(status) => battery_row.set_subtitle(&status.subtitle()),
+                                Err(_) => battery_row.set_subtitle(
+                                    "Battery data unavailable; retrying automatically",
+                                ),
+                            }
+                        }
+                        pending_battery = None;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if *generation == battery_generation {
+                            battery_row
+                                .set_subtitle("Battery data unavailable; retrying automatically");
+                        }
+                        pending_battery = None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if pending_battery.is_none()
+                && last_battery_query.is_none_or(|at| at.elapsed() >= Duration::from_secs(20))
+            {
+                if let Some(serial) = battery_selection.clone() {
+                    let (sender, receiver) = mpsc::channel();
+                    pending_battery = Some((battery_generation, receiver));
+                    last_battery_query = Some(Instant::now());
+                    thread::spawn(move || {
+                        let _ = sender.send(query_battery(&serial));
+                    });
+                }
+            }
             glib::ControlFlow::Continue
         }
     });
@@ -1384,7 +1507,9 @@ pub fn build_ui(app: &adw::Application) {
                 .build();
 
             let hint = gtk4::Label::builder()
-                .label("On phone: Developer options -> Wireless debugging -> Pair device with QR code")
+                .label(
+                    "On phone: Developer options -> Wireless debugging -> Pair device with QR code",
+                )
                 .wrap(true)
                 .justify(gtk4::Justification::Center)
                 .build();

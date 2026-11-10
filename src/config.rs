@@ -39,8 +39,8 @@ pub struct AppConfig {
     pub flip: bool,
     pub zoom: f64,
     pub torch: bool,
-    pub mic_mode: String, // "off", "voice", "raw", "camcorder"
-    pub bitrate: String,  // "auto", "8M", "16M", "24M"
+    pub mic_mode: String,    // "off", "voice", "raw", "camcorder"
+    pub bitrate: String,     // "auto", "8M", "16M", "24M"
     pub v4l2_buffer: String, // "0", "30", "50"
     pub preview: bool,
     pub auto_reconnect: bool,
@@ -87,7 +87,9 @@ impl AppConfig {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|| "Recently".to_string());
 
-        let addr = address.unwrap_or(if is_wifi { serial } else { "" }).to_string();
+        let addr = address
+            .unwrap_or(if is_wifi { serial } else { "" })
+            .to_string();
 
         if let Some(existing) = self
             .history
@@ -110,7 +112,11 @@ impl AppConfig {
                 0,
                 DeviceHistory {
                     serial: serial.to_string(),
-                    model: if model.is_empty() { serial.to_string() } else { model.to_string() },
+                    model: if model.is_empty() {
+                        serial.to_string()
+                    } else {
+                        model.to_string()
+                    },
                     address: addr,
                     is_wifi,
                     last_seen: now,
@@ -126,7 +132,8 @@ impl AppConfig {
     }
 
     pub fn forget_device(&mut self, serial: &str) {
-        self.history.retain(|d| d.serial != serial && d.address != serial);
+        self.history
+            .retain(|d| d.serial != serial && d.address != serial);
     }
 }
 
