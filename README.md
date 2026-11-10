@@ -40,7 +40,8 @@ sudo pacman -S scrcpy android-tools v4l2loopback-dkms libadwaita gtk4 qrencode
 # Ubuntu / Debian
 sudo apt install scrcpy adb v4l2loopback-dkms libadwaita-1-dev libgtk-4-dev qrencode
 
-# Fedora
+# Fedora (enable the COPR repository for scrcpy first)
+sudo dnf copr enable zeno/scrcpy
 sudo dnf install scrcpy android-tools v4l2loopback libadwaita-devel gtk4-devel qrencode
 ```
 
@@ -76,7 +77,7 @@ See the complete **[Connection Guide](docs/connection.md)** for detailed walkthr
 
 ## Command Line Interface (CLI)
 
-Avyx-cam includes CLI commands for scripting and keyboard shortcuts:
+Avyx-cam includes CLI commands for scripting and keyboard shortcuts (ensure `~/.local/bin` is on your `PATH`, or run `~/.local/bin/avyx-cam`):
 
 ```bash
 avyx-cam                 # Launch GTK4 control center

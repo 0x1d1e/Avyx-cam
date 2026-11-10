@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
     printf '%s\n' 'Usage: ./install.sh [--install-deps] [--prefix ABSOLUTE_PATH] [--data-home ABSOLUTE_PATH]' \
         'Build locked Rust dependencies and install Avyx-cam for the current user.' \
-        'Defaults: ~/.local/bin/avyx-cam and ${XDG_DATA_HOME:-~/.local/share}/applications/avyx-cam.desktop' \
+        'Defaults: ~/.local/bin/avyx-cam and ${XDG_DATA_HOME:-~/.local/share}/applications/com.local.avyxcam.desktop' \
         '--install-deps installs distribution packages using sudo; no repositories are added.'
 }
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
@@ -29,6 +29,7 @@ for install_path in "$install_prefix" "$install_data_home"; do
     [[ ! "$install_path" =~ [[:cntrl:]] ]] || fail 'Installation paths cannot contain control characters'
 done
 [[ "$install_prefix" != *%* ]] || fail 'Install prefix cannot contain percent signs (desktop launcher limitation)'
+[[ "$install_prefix" != *=* ]] || fail 'Install prefix cannot contain equals signs (desktop launcher limitation)'
 [[ "$(uname -s)" == Linux ]] || fail 'Avyx-cam currently supports Linux only'
 ((EUID != 0)) || fail 'Run as your desktop user; --install-deps invokes sudo only for packages'
 source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -113,19 +114,26 @@ built_binary="$source_dir/target/$host_target/release/avyx-cam"
 "$built_binary" --help >/dev/null
 
 install -d -- "$install_prefix/bin" "$install_data_home/applications"
+binary_dest="$install_prefix/bin/avyx-cam"
+desktop_dest="$install_data_home/applications/com.local.avyxcam.desktop"
+[[ ! -d "$binary_dest" ]] || fail "Destination is a directory, cannot install executable: $binary_dest"
+[[ ! -d "$desktop_dest" ]] || fail "Destination is a directory, cannot install desktop launcher: $desktop_dest"
+
 binary_stage="$(mktemp "$install_prefix/bin/.avyx-cam.XXXXXX")"
 desktop_stage=''
+binary_backup=''
 cleanup() {
     rm -f -- "$binary_stage"
     if [[ -n "$desktop_stage" ]]; then rm -f -- "$desktop_stage"; fi
+    if [[ -n "$binary_backup" ]]; then rm -f -- "$binary_backup"; fi
 }
 trap cleanup EXIT
-desktop_stage="$(mktemp --suffix=.desktop "$install_data_home/applications/.avyx-cam.XXXXXX")"
+desktop_stage="$(mktemp --suffix=.desktop "$install_data_home/applications/.com.local.avyxcam.XXXXXX")"
 install -m 755 -- "$built_binary" "$binary_stage"
 
 # Desktop Exec first unescapes string values, then parses quoted arguments.
 # Escape both layers; percent is separately interpreted as a field code.
-exec_path="$install_prefix/bin/avyx-cam"
+exec_path="$binary_dest"
 exec_path="${exec_path//\\/\\\\}"
 exec_path="${exec_path//\"/\\\"}"
 exec_path="${exec_path//\$/\\\$}"
@@ -138,13 +146,33 @@ printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Avyx-cam' \
     'Categories=AudioVideo;Video;' 'StartupNotify=true' > "$desktop_stage"
 chmod 644 "$desktop_stage"
 if command -v desktop-file-validate >/dev/null; then desktop-file-validate "$desktop_stage"; fi
+
+had_binary=false
+if [[ -e "$binary_dest" || -L "$binary_dest" ]]; then
+    had_binary=true
+    binary_backup="$(mktemp "$install_prefix/bin/.avyx-cam.backup.XXXXXX")"
+    if ! ln -f -- "$binary_dest" "$binary_backup" 2>/dev/null; then
+        cp -fPp -- "$binary_dest" "$binary_backup"
+    fi
+fi
+
 # Rename into place so replacing a running executable does not truncate its file.
-mv -fT -- "$binary_stage" "$install_prefix/bin/avyx-cam"
-mv -fT -- "$desktop_stage" "$install_data_home/applications/avyx-cam.desktop"
+mv -fT -- "$binary_stage" "$binary_dest"
+if ! mv -fT -- "$desktop_stage" "$desktop_dest"; then
+    if "$had_binary" && [[ -n "$binary_backup" && ( -e "$binary_backup" || -L "$binary_backup" ) ]]; then
+        mv -fT -- "$binary_backup" "$binary_dest" || true
+    elif ! "$had_binary"; then
+        rm -f -- "$binary_dest" || true
+    fi
+    fail "Failed to install desktop launcher: $desktop_dest"
+fi
 if command -v update-desktop-database >/dev/null; then
     update-desktop-database "$install_data_home/applications" || true
 fi
-printf 'Installed: %s/bin/avyx-cam\nLaunch Avyx-cam from your application menu.\n' "$install_prefix"
+printf 'Installed: %s\nDesktop entry: %s\nLaunch Avyx-cam from your application menu.\n' "$binary_dest" "$desktop_dest"
+if [[ ":$PATH:" != *":$install_prefix/bin:"* ]]; then
+    printf 'Add %s/bin to PATH to run `avyx-cam` from a terminal.\n' "$install_prefix"
+fi
 if [[ ! -e /dev/video0 ]]; then
     printf 'First launch: use System to enable /dev/video0 (requires v4l2loopback and matching kernel headers).\n'
 fi
