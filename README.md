@@ -54,15 +54,13 @@ sudo dnf install scrcpy android-tools v4l2loopback libadwaita-devel gtk4-devel q
    ```
    *(Or click "Install" in Avyx-cam System tab to make it load automatically on boot).*
 
-2. **Run Avyx-cam**:
+2. **Build and install Avyx-cam** from the downloaded source:
    ```bash
-   cargo run --release
+   ./install.sh --install-deps
    ```
-   Or install to `~/.local/bin`:
-   ```bash
-   cargo build --release
-   cp target/release/avyx-cam ~/.local/bin/avyx-cam
-   ```
+   Already have the dependencies? Use `./install.sh`. This builds with Cargo, installs to `~/.local/bin`, and adds the application-menu launcher. Python/uv is not required.
+
+   Open **Avyx-cam** from the application menu. See [installation details](docs/installation.md) for supported package managers, custom paths, updates, and removal. Downloading source alone does not run a build; prebuilt release downloads are planned.
 
 ---
 
