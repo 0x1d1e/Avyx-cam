@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -8,7 +7,7 @@ pub const VIDEO_DEV: &str = "/dev/video0";
 pub const MIC_SINK: &str = "PhoneMic_sink";
 pub const MIC_SOURCE: &str = "PhoneMic";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdbDevice {
     pub serial: String,
     pub state: String,
@@ -16,7 +15,7 @@ pub struct AdbDevice {
     pub is_wifi: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CameraInfo {
     pub id: String,
     pub facing: String,
@@ -25,21 +24,7 @@ pub struct CameraInfo {
 }
 
 pub fn run_out(cmd: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| format!("{cmd}: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    if out.status.success() {
-        Ok(stdout)
-    } else {
-        Err(if stderr.trim().is_empty() {
-            stdout
-        } else {
-            stderr
-        })
-    }
+    crate::process::run_out(cmd, args)
 }
 
 pub fn video_exists() -> bool {
@@ -61,7 +46,9 @@ pub fn install_boot_persistence() -> Result<(), String> {
         "modprobe -r v4l2loopback 2>/dev/null || true; ",
         "modprobe v4l2loopback devices=1 video_nr=0 card_label=AvyxCam exclusive_caps=1"
     );
-    run_out("pkexec", &["sh", "-c", script]).map(|_| ())
+    // Interactive authorization gets its own deadline, separate from automatic probes.
+    crate::process::run_out_timeout("pkexec", &["sh", "-c", script], Duration::from_secs(120))
+        .map(|_| ())
 }
 
 pub fn load_or_reload_v4l2(reload: bool) -> Result<(), String> {
@@ -70,17 +57,17 @@ pub fn load_or_reload_v4l2(reload: bool) -> Result<(), String> {
     } else {
         "modprobe v4l2loopback devices=1 video_nr=0 card_label=AvyxCam exclusive_caps=1"
     };
-    run_out("pkexec", &["sh", "-c", cmd]).map(|_| ())
+    crate::process::run_out_timeout("pkexec", &["sh", "-c", cmd], Duration::from_secs(120))
+        .map(|_| ())
 }
 
 pub fn video_busy_apps() -> Vec<String> {
     if !video_exists() {
         return Vec::new();
     }
-    let Ok(out) = Command::new("fuser").arg(VIDEO_DEV).output() else {
+    let Ok(text) = run_out("fuser", &[VIDEO_DEV]) else {
         return Vec::new();
     };
-    let text = String::from_utf8_lossy(&out.stdout);
     let mut apps = Vec::new();
     for pid in text.split_whitespace() {
         let comm_path = format!("/proc/{pid}/comm");
@@ -202,7 +189,12 @@ pub fn switch_usb_to_wifi(usb_serial: &str, port: u16) -> Result<String, String>
         .ok_or_else(|| "Phone Wi-Fi IP not found. Connect phone to the same Wi-Fi.".to_string())?;
     let port_str = port.to_string();
     run_out("adb", &["-s", usb_serial, "tcpip", &port_str])?;
-    thread::sleep(Duration::from_millis(1200));
+    for _ in 0..60 {
+        if crate::process::cancelled() {
+            return Err("Operation cancelled".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     let endpoint = format!("{ip}:{port}");
     let out = run_out("adb", &["connect", &endpoint])?;
     if out.to_lowercase().contains("connected") {
@@ -225,34 +217,7 @@ pub fn connect_wifi_timeout(
     } else {
         format!("{}:5555", endpoint.trim())
     };
-    let mut child = Command::new("adb")
-        .args(["connect", &ep])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Connect error: {e}"))?;
-    let started = std::time::Instant::now();
-    let out = loop {
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Connect timed out".into());
-        }
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            let output = child.wait_with_output().map_err(|e| e.to_string())?;
-            if !status.success() {
-                let err = String::from_utf8_lossy(&output.stderr);
-                return Err(if err.trim().is_empty() {
-                    String::from_utf8_lossy(&output.stdout).trim().to_string()
-                } else {
-                    err.trim().to_string()
-                });
-            }
-            break String::from_utf8_lossy(&output.stdout).to_string();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
+    let out = crate::process::run_out_timeout("adb", &["connect", &ep], timeout)?;
     if out.to_lowercase().contains("connected") {
         Ok(ep)
     } else {
@@ -265,17 +230,10 @@ pub fn disconnect_wifi(endpoint: &str) -> Result<(), String> {
 }
 
 pub fn probe_cameras(serial: &str) -> Vec<CameraInfo> {
-    let Ok(out) = Command::new("scrcpy")
-        .args(["-s", serial, "--list-camera-sizes"])
-        .output()
+    let Ok(text) = crate::process::run_combined("scrcpy", &["-s", serial, "--list-camera-sizes"])
     else {
         return Vec::new();
     };
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
     let mut cams: Vec<CameraInfo> = Vec::new();
     let mut in_high_speed = false;
 
@@ -403,111 +361,5 @@ pub fn optimal_camera_rotation(camera_id: &str, surface_deg: u32) -> &'static st
             270 => "180",
             _ => "0",
         }
-    }
-}
-
-pub fn try_auto_reconnect_history<F>(
-    history: &[crate::config::DeviceHistory],
-    mut should_continue: F,
-) -> Option<String>
-where
-    F: FnMut() -> bool,
-{
-    // A discovered service is not sufficient evidence that this is a remembered phone.
-    // Until stable device identity is available, only retry saved endpoints.
-    for item in history {
-        if !should_continue() {
-            return None;
-        }
-        if item.is_wifi && !item.address.is_empty() {
-            if let Ok(connected) = connect_wifi(&item.address) {
-                return Some(connected);
-            }
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stops_when_should_continue_becomes_false() {
-        let history = vec![
-            crate::config::DeviceHistory {
-                serial: "192.0.2.1:5555".into(),
-                model: "Phone 1".into(),
-                address: "192.0.2.1:5555".into(),
-                is_wifi: true,
-                last_seen: "test".into(),
-                camera_id: "0".into(),
-                resolution: "1280x720".into(),
-                fps: "30".into(),
-            },
-            crate::config::DeviceHistory {
-                serial: "192.0.2.2:5555".into(),
-                model: "Phone 2".into(),
-                address: "192.0.2.2:5555".into(),
-                is_wifi: true,
-                last_seen: "test".into(),
-                camera_id: "0".into(),
-                resolution: "1280x720".into(),
-                fps: "30".into(),
-            },
-        ];
-        let mut checks = 0;
-        let res = try_auto_reconnect_history(&history, || {
-            checks += 1;
-            false
-        });
-        assert_eq!(res, None);
-        assert_eq!(checks, 1);
-    }
-
-    #[test]
-    fn aborts_subsequent_attempts_after_mid_flight_cancel() {
-        let history = vec![
-            crate::config::DeviceHistory {
-                serial: "192.0.2.1:5555".into(),
-                model: "Phone 1".into(),
-                address: "192.0.2.1:5555".into(),
-                is_wifi: true,
-                last_seen: "test".into(),
-                camera_id: "0".into(),
-                resolution: "1280x720".into(),
-                fps: "30".into(),
-            },
-            crate::config::DeviceHistory {
-                serial: "192.0.2.2:5555".into(),
-                model: "Phone 2".into(),
-                address: "192.0.2.2:5555".into(),
-                is_wifi: true,
-                last_seen: "test".into(),
-                camera_id: "0".into(),
-                resolution: "1280x720".into(),
-                fps: "30".into(),
-            },
-            crate::config::DeviceHistory {
-                serial: "192.0.2.3:5555".into(),
-                model: "Phone 3".into(),
-                address: "192.0.2.3:5555".into(),
-                is_wifi: true,
-                last_seen: "test".into(),
-                camera_id: "0".into(),
-                resolution: "1280x720".into(),
-                fps: "30".into(),
-            },
-        ];
-        let mut attempts = 0;
-        // First check succeeds; mid-flight cancel triggers before second check.
-        let res = try_auto_reconnect_history(&history, || {
-            attempts += 1;
-            attempts <= 1
-        });
-        assert_eq!(res, None);
-        // Checked once before phone 1 (allowed), once before phone 2 (cancelled -> abort).
-        // Phone 3 is never examined.
-        assert_eq!(attempts, 2);
     }
 }

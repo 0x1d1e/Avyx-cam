@@ -16,7 +16,8 @@ No Android app installation required. Uses native Android ADB media streaming vi
 - **High Frame Rates**: The GUI offers up to 120 fps on supported back cameras. Available modes and delivered frame rates depend on the phone.
 - **PipeWire Virtual Microphone**: Low-latency `PhoneMic` source selectable in Zoom, Google Meet, Discord, and OBS.
 - **Full Lens & Hardware Controls**: Front/back switch, zoom slider, flashlight/torch, flip/un-mirror, bitrate, and v4l2 buffering.
-- **Background Mode**: Disable live preview window to run purely as a headless system webcam.
+- **Live Preview with QR Links**: The Camera tab shows the live feed. QR codes containing http/https links are detected locally and highlighted. Click one to open it in your PC browser. Credentials in URLs and non-web schemes are ignored.
+- **Background Mode**: v4l2loopback allows one reader at a time, so turn live preview off when Zoom, OBS or a browser should use the camera.
 - **CLI & GUI Modes**: Control completely through the GTK4 GUI or use command-line shortcuts (`avyx-cam back`, `avyx-cam stop`).
 
 ---
@@ -78,13 +79,15 @@ Avyx-cam includes CLI commands for scripting and keyboard shortcuts (ensure `~/.
 avyx-cam                 # Launch GTK4 control center
 avyx-cam back            # Start back camera stream
 avyx-cam front           # Start front camera stream
-avyx-cam stop            # Stop all active streams
+avyx-cam stop            # Stop Avyx-cam's shared session and cancel retries
 avyx-cam wifi            # Switch plugged USB phone to Wi-Fi
 avyx-cam status          # Show stream and device status
 avyx-cam --help          # Show CLI options
 ```
 
 ---
+
+GUI and CLI control one background session. Closing the window keeps streaming supervised; reopen it to attach. Stop from either interface cancels pending starts and reconnects until you explicitly start again. See [session behavior and upgrade notes](docs/connection.md#session-controls).
 
 ## Development
 
@@ -94,11 +97,15 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-The optional GUI smoke test uses simulated Android and streaming commands. It requires a graphical session, `/dev/video0`, and no active webcam stream:
+The optional GTK test uses the production owner and CLI with simulated Android/streaming commands in an isolated runtime directory. Build the binary first. A graphical session and `/dev/video0` are required:
 
 ```bash
+cargo build
 cargo test gui_smoke -- --ignored --test-threads=1
+cargo test --test session_owner -- --include-ignored
 ```
+
+A regular file mounted at `/dev/video0` inside a `bwrap` sandbox is sufficient for these simulated tests; no camera frames are produced. They verify lifecycle behavior, not phone streaming or receiving-app recovery.
 
 See [optimization scope](docs/optimization-plan.md) for planned milestones and validation criteria. Battery temperature comes from Android's battery service; it does not measure camera or CPU temperature. Monitoring is read-only and does not control charging or stream quality.
 

@@ -5,6 +5,9 @@ edition = "2021"
 description = "Use your Android phone as a Linux webcam and microphone via scrcpy, v4l2loopback, and PipeWire"
 
 [dependencies]
+libc = "0.2"
+linux-video = "0.1.1"
+rqrr = { version = "0.10.1", default-features = false }
 gtk4 = "0.9"
 libadwaita = { version = "0.7", features = ["v1_5"] }
 mdns-sd = "0.13"

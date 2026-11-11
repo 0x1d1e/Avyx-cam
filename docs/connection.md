@@ -51,7 +51,7 @@ If your phone is already connected via USB:
 
 1. Plug phone via USB.
 2. When prompted on phone, tap **Allow USB debugging** and check **Always allow from this computer**.
-3. Avyx-cam detects the phone instantly. If **Auto-start on USB Plug-in** is enabled, streaming begins automatically.
+3. Avyx-cam detects the phone during background discovery. If **Auto-start on USB Plug-in** is enabled, a new USB connection starts streaming unless you previously pressed Stop. A newly started session owner begins idle, even with a phone already connected. Stop is remembered in the per-login runtime directory, so an owner crash or restart does not undo it; logging out or rebooting clears it. If that marker cannot be written, Stop still takes effect but reports an error, because it would not survive an owner crash. An explicit Start fails if the marker cannot be cleared.
 
 ---
 
@@ -59,7 +59,23 @@ If your phone is already connected via USB:
 
 - Avyx-cam remembers previously paired USB and Wi-Fi devices in `~/.config/avyx-cam/config.json`.
 - When opening Avyx-cam, click **Connect** next to any remembered device in the **Saved Devices** list for 1-click reconnect.
-- Auto-reconnect automatically probes remembered devices when the camera stream drops.
+- Auto-reconnect retries an explicitly started session using remembered addresses and authorized devices. Turning it off cancels pending retry work and leaves a healthy stream running.
+
+## Session Controls
+
+GUI and CLI share one session per Linux user. `avyx-cam back` and `avyx-cam front` work without a graphical display. Closing the GUI leaves the session supervised; reopening it attaches to the same session. Changing camera settings replaces the owned stream in sequence and may interrupt frames.
+
+**Stop** and `avyx-cam stop` cancel pending starts and reconnects as well as the active stream. Unplugging/replugging a phone or enabling Auto-reconnect does not undo Stop. Click Start or run a CLI camera command to resume.
+
+**Concurrent clients:** the GUI and CLI send only the settings they changed, and the owner merges them, so one client cannot overwrite another's unrelated settings. If two clients change the same setting, the last request wins.
+
+**USB to Wi-Fi handoff:** after a successful switch, the owner rebinds the active session to the Wi-Fi endpoint without interrupting the USB stream. When you unplug USB, the stream resumes over Wi-Fi through normal Auto-reconnect.
+
+`avyx-cam status` reports session intent, process state, and errors. A running scrcpy process does not prove that frames reach `/dev/video0` or your meeting app. Authorization, camera privacy, and camera-in-use errors require action on the phone followed by an explicit restart.
+
+The owner starts on demand and begins idle after a crash. USB auto-start responds to new connections after initial discovery. Session logs are in `$XDG_RUNTIME_DIR/avyx-cam/owner.log` and `stream.log`; when XDG_RUNTIME_DIR is absent, they are under `${TMPDIR:-/tmp}/avyx-cam-<uid>/`. Inspect stream logs in the System tab.
+
+**Upgrading from an older version:** existing standalone scrcpy streams are not adopted or stopped automatically. Stop them using their original launcher or terminal before starting a new Avyx-cam session. Legacy PID files and process-name matches never authorize termination.
 
 ---
 
@@ -83,3 +99,4 @@ If your phone is already connected via USB:
 
 ### Microphone not showing in apps
 - In Discord, Zoom, OBS, or browser settings, select **PhoneMic** or **Monitor of PhoneMic_sink** as your input source.
+- Only one application can read `/dev/video0` at a time. Turn **Live Camera Preview** off before opening the camera in another app, otherwise that app reports the device as busy.

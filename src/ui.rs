@@ -1,16 +1,13 @@
 use crate::battery::{query_battery, BatteryStatus};
-use crate::config::{load_config, save_config, AppConfig};
+use crate::config::{diff, load_config, AppConfig};
 use crate::devices::{
     boot_persistence_installed, connect_wifi, disconnect_wifi, ensure_virtual_mic,
-    get_device_orientation, install_boot_persistence, list_adb_devices, load_or_reload_v4l2,
-    mic_ready, optimal_camera_rotation, probe_cameras, switch_usb_to_wifi,
-    try_auto_reconnect_history, v4l2_current_size, video_busy_apps, video_exists, AdbDevice,
+    install_boot_persistence, load_or_reload_v4l2, mic_ready, switch_usb_to_wifi,
+    v4l2_current_size, video_busy_apps, video_exists, AdbDevice,
 };
 use crate::qr::{adb_qr_payload, draw_qr_code, pair_and_connect, random_token};
-use crate::stream::{
-    classify_crash, next_fallback_resolution, ran_long_enough, read_external_pid, read_log,
-    start_scrcpy, stop_all_streams, StreamHandle,
-};
+use crate::session::{self, Request, Snapshot};
+use crate::stream::read_log;
 use adw::prelude::*;
 use gtk4::prelude::*;
 use gtk4::{gio, glib};
@@ -28,15 +25,61 @@ struct AppState {
     cfg: AppConfig,
     devices: Vec<AdbDevice>,
     selected_serial: Option<String>,
-    stream: Option<StreamHandle>,
-    user_stopped: bool,
-    auto_started_usb_serial: Option<String>,
-    last_usb_seen: bool,
-    probed_serial: Option<String>,
+    session: Snapshot,
+    system: SystemStatus,
     back_has_high_speed: bool,
-    reconnect_at: Option<Instant>,
-    last_detected_orientation: Option<u32>,
-    last_history_reconnect_attempt: Option<Instant>,
+}
+
+impl AppState {
+    /// Only fields this client changed since the owner's last snapshot are sent.
+    fn pending_changes(&mut self) -> crate::config::Changes {
+        let changes = diff(&self.session.cfg, &self.cfg);
+        self.session.cfg = self.cfg.clone();
+        changes
+    }
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct SystemStatus {
+    video: bool,
+    busy: Vec<String>,
+    format: Option<String>,
+    persistent: bool,
+    mic: bool,
+    log: String,
+}
+
+// One FIFO preserves intent order. Poll replies carry the last processed UI revision,
+// so an older reply cannot overwrite a newer click or settings change.
+struct SessionClient {
+    tx: mpsc::Sender<(u64, Request)>,
+    revision: Cell<u64>,
+}
+impl SessionClient {
+    fn send(&self, request: Request) {
+        let revision = self.revision.get().wrapping_add(1);
+        self.revision.set(revision);
+        let _ = self.tx.send((revision, request));
+    }
+}
+
+fn background<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+    done: impl FnOnce(T) + 'static,
+) {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    let mut done = Some(done);
+    glib::timeout_add_local(Duration::from_millis(80), move || match rx.try_recv() {
+        Ok(result) => {
+            done.take().unwrap()(result);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+    });
 }
 
 type PollCallback = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
@@ -67,24 +110,43 @@ pub fn build_ui(app: &adw::Application) {
         cfg: load_config(),
         devices: Vec::new(),
         selected_serial: None,
-        stream: None,
-        user_stopped: false,
-        auto_started_usb_serial: None,
-        last_usb_seen: false,
-        probed_serial: None,
+        session: Snapshot::default(),
+        system: SystemStatus::default(),
         back_has_high_speed: true,
-        reconnect_at: None,
-        last_detected_orientation: None,
-        last_history_reconnect_attempt: None,
     }));
 
     let poll_tick_holder: PollCallback = Rc::new(RefCell::new(None));
     let history_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
 
-    let reconnect_cancel = Arc::new(AtomicBool::new(false));
-    let reconnect_in_flight = Arc::new(AtomicBool::new(false));
-
-    let _ = ensure_virtual_mic();
+    let closed = Arc::new(AtomicBool::new(false));
+    let (command_tx, command_rx) = mpsc::channel();
+    let (session_tx, session_rx) = mpsc::channel();
+    let client = Rc::new(SessionClient {
+        tx: command_tx,
+        revision: Cell::new(0),
+    });
+    thread::spawn({
+        let closed = closed.clone();
+        move || {
+            let mut revision = 0;
+            while !closed.load(Ordering::Relaxed) {
+                let request = match command_rx.recv_timeout(Duration::from_millis(300)) {
+                    Ok((next, request)) => {
+                        revision = next;
+                        request
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => Request::Status,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                if session_tx
+                    .send((revision, session::request(request)))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
 
     let toast_overlay = adw::ToastOverlay::new();
     let stack = adw::ViewStack::new();
@@ -136,6 +198,8 @@ pub fn build_ui(app: &adw::Application) {
         .build();
     warning_row.add_suffix(&fix_v4l2_inline_btn);
     status_group.add(&warning_row);
+    let camera_preview = Rc::new(crate::preview::CameraPreview::new());
+    status_group.add(camera_preview.widget());
     cam_page.add(&status_group);
 
     let battery_group = adw::PreferencesGroup::new();
@@ -270,8 +334,8 @@ pub fn build_ui(app: &adw::Application) {
     audio_group.add(&mic_row);
 
     let preview_row = adw::SwitchRow::builder()
-        .title("Show Live Preview Window")
-        .subtitle("Turn off for background webcam mode")
+        .title("Live Camera Preview")
+        .subtitle("Click QR links directly in the video")
         .active(state.borrow().cfg.preview)
         .build();
     audio_group.add(&preview_row);
@@ -494,53 +558,18 @@ pub fn build_ui(app: &adw::Application) {
         }
     };
 
-    // Start / Restart stream helper
     let launch_stream = {
         let state = state.clone();
-        let show_toast = show_toast.clone();
-        move |override_res: Option<&str>, quick_retried: bool| {
-            let (serial, cfg) = {
-                let st = state.borrow();
-                let Some(sel) = st.selected_serial.clone() else {
-                    show_toast("No authorized phone selected.");
-                    return;
-                };
-                let ready = st
-                    .devices
-                    .iter()
-                    .any(|d| d.serial == sel && d.state == "device");
-                if !ready {
-                    show_toast("Authorize USB debugging on your phone first.");
-                    return;
-                }
-                (sel, st.cfg.clone())
-            };
-
-            let busy = video_busy_apps();
-            if !busy.is_empty() {
-                if let Some(cur_sz) = v4l2_current_size() {
-                    let target = override_res.unwrap_or(&cfg.resolution);
-                    if cur_sz != target {
-                        show_toast(&format!(
-                            "Warning: {} holds /dev/video0 at {}",
-                            busy.join(", "),
-                            cur_sz
-                        ));
-                    }
-                }
-            }
-
-            match start_scrcpy(&serial, &cfg, override_res, quick_retried) {
-                Ok(handle) => {
-                    let mut st = state.borrow_mut();
-                    st.stream = Some(handle);
-                    st.user_stopped = false;
-                    st.reconnect_at = None;
-                }
-                Err(err) => {
-                    show_toast(&err);
-                }
-            }
+        let client = client.clone();
+        move || {
+            let mut st = state.borrow_mut();
+            let changes = st.pending_changes();
+            client.send(Request::Start {
+                serial: st.selected_serial.clone(),
+                changes,
+            });
+            st.session.desired = true;
+            st.session.phase = "starting".into();
         }
     };
 
@@ -562,6 +591,20 @@ pub fn build_ui(app: &adw::Application) {
         let log_view = log_view.clone();
         let auto_rotate_row = auto_rotate_row.clone();
         let rot_row = rot_row.clone();
+        let back_btn = back_btn.clone();
+        let front_btn = front_btn.clone();
+        let res_row = res_row.clone();
+        let flip_row = flip_row.clone();
+        let zoom_scale = zoom_scale.clone();
+        let torch_row_sync = torch_row.clone();
+        let mic_row = mic_row.clone();
+        let preview_row = preview_row.clone();
+        let camera_preview = camera_preview.clone();
+        let bitrate_row = bitrate_row.clone();
+        let buffer_row = buffer_row.clone();
+        let auto_usb_row = auto_usb_row.clone();
+        let auto_reconn_row = auto_reconn_row.clone();
+        let client = client.clone();
         let history_group = history_group.clone();
         let history_rows = history_rows.clone();
         let poll_tick_holder = poll_tick_holder.clone();
@@ -578,7 +621,7 @@ pub fn build_ui(app: &adw::Application) {
                 (
                     st.devices.clone(),
                     st.selected_serial.clone(),
-                    st.stream.is_some(),
+                    st.session.pid.is_some(),
                     st.cfg.clone(),
                 )
             };
@@ -606,17 +649,34 @@ pub fn build_ui(app: &adw::Application) {
                 .and_then(|s| devices.iter().find(|d| &d.serial == s))
                 .cloned();
 
-            let is_live = stream_active || read_external_pid().is_some();
-            let v4l_ok = video_exists();
-            let busy = if !is_live && v4l_ok {
-                video_busy_apps()
-            } else {
-                Vec::new()
-            };
+            let st = state.borrow();
+            let is_live = stream_active;
+            let v4l_ok = st.system.video;
+            let busy = st.system.busy.clone();
+            let phase = st.session.phase.clone();
+            let desired = st.session.desired;
+            let error = st.session.error.clone();
+            drop(st);
 
             // Status row + Start/Stop button
-            if is_live {
-                status_row.set_title("Camera &amp; Mic Live");
+            if desired && !is_live {
+                status_row.set_title(match phase.as_str() {
+                    "starting" => "Starting Camera",
+                    "waiting" => "Waiting to Reconnect",
+                    _ => "Camera Needs Attention",
+                });
+                status_row.set_subtitle(error.as_deref().unwrap_or("Preparing camera session"));
+                start_stop_btn.set_label("Stop Camera");
+                start_stop_btn.remove_css_class("suggested-action");
+                start_stop_btn.add_css_class("destructive-action");
+                start_stop_btn.set_sensitive(true);
+            } else if phase == "stopping" {
+                status_row.set_title("Stopping Camera");
+                status_row.set_subtitle("Cancelling pending starts and reconnects");
+                start_stop_btn.set_label("Stopping…");
+                start_stop_btn.set_sensitive(false);
+            } else if is_live {
+                status_row.set_title("Camera Running");
                 let lens_name = if cfg.camera_id == "1" {
                     "Front"
                 } else {
@@ -637,7 +697,7 @@ pub fn build_ui(app: &adw::Application) {
                 start_stop_btn.set_sensitive(true);
             } else if let Some(dev) = &cur_dev {
                 if dev.state == "device" {
-                    status_row.set_title(&format!("Ready — {}", dev.model));
+                    status_row.set_title(&format!("Ready - {}", dev.model));
                     status_row.set_subtitle(if dev.is_wifi {
                         "Connected over Wi-Fi"
                     } else {
@@ -698,33 +758,62 @@ pub fn build_ui(app: &adw::Application) {
 
             // System tab status
             if v4l_ok {
-                let fmt = v4l2_current_size().unwrap_or_else(|| "idle".to_string());
+                let fmt = state
+                    .borrow()
+                    .system
+                    .format
+                    .clone()
+                    .unwrap_or_else(|| "idle".to_string());
                 v4l2_sys_row.set_subtitle(&format!("Active ({fmt})"));
             } else {
                 v4l2_sys_row.set_subtitle("Not loaded");
             }
-            if boot_persistence_installed() {
+            if state.borrow().system.persistent {
                 persist_row.set_subtitle("Installed (/etc/modules-load.d/avyx-cam.conf)");
                 persist_btn.set_label("Reinstall");
             } else {
                 persist_row.set_subtitle("Not installed (loads manually after reboot)");
                 persist_btn.set_label("Install");
             }
-            mic_sys_row.set_subtitle(if mic_ready() {
+            mic_sys_row.set_subtitle(if state.borrow().system.mic {
                 "Active (PhoneMic ready)"
             } else {
                 "Not loaded"
             });
 
             // Logs
-            let txt = read_log();
+            let txt = state.borrow().system.log.clone();
             let buf = log_view.buffer();
             let current = buf.text(&buf.start_iter(), &buf.end_iter(), false);
             if current.as_str() != txt {
                 buf.set_text(&txt);
             }
 
-            // Sync auto-rotate and rotation state
+            // Apply the owner's settings when another client changes the session.
+            back_btn.set_active(cfg.camera_id != "1");
+            front_btn.set_active(cfg.camera_id == "1");
+            if let Some(pos) = RESOLUTIONS
+                .iter()
+                .position(|&value| value == cfg.resolution)
+            {
+                res_row.set_selected(pos as u32);
+            }
+            flip_row.set_active(cfg.flip);
+            zoom_scale.set_value(cfg.zoom);
+            torch_row_sync.set_active(cfg.torch);
+            preview_row.set_active(cfg.preview);
+            camera_preview.set_session(state.borrow().session.pid, cfg.preview);
+            auto_usb_row.set_active(cfg.auto_start_usb);
+            auto_reconn_row.set_active(cfg.auto_reconnect);
+            for (row, values, current) in [
+                (&mic_row, MIC_MODES, cfg.mic_mode.as_str()),
+                (&bitrate_row, BITRATES, cfg.bitrate.as_str()),
+                (&buffer_row, BUFFERS, cfg.v4l2_buffer.as_str()),
+            ] {
+                if let Some(pos) = values.iter().position(|(_, value)| *value == current) {
+                    row.set_selected(pos as u32);
+                }
+            }
             auto_rotate_row.set_active(cfg.auto_rotate);
             rot_row.set_sensitive(!cfg.auto_rotate);
             if let Some(pos) = ROTATIONS.iter().position(|(_, v)| *v == cfg.rotation) {
@@ -821,13 +910,13 @@ pub fn build_ui(app: &adw::Application) {
                         .build();
                     let del_serial = dev.serial.clone();
                     let state = state.clone();
-                    let p_holder = poll_tick_holder.clone();
+                    let client = client.clone();
                     forget_btn.connect_clicked(move |_| {
-                        state.borrow_mut().cfg.forget_device(&del_serial);
-                        save_config(&state.borrow().cfg);
-                        if let Some(f) = p_holder.borrow().as_ref() {
-                            f();
-                        }
+                        let mut st = state.borrow_mut();
+                        st.cfg.forget_device(&del_serial);
+                        client.send(Request::Forget {
+                            serial: del_serial.clone(),
+                        });
                     });
                     row.add_suffix(&forget_btn);
 
@@ -840,229 +929,109 @@ pub fn build_ui(app: &adw::Application) {
         }
     };
 
-    // Poll devices, supervise scrcpy, handle auto-start & auto-reconnect
+    // Refresh asks the owner; GTK never discovers devices or supervises children.
     let poll_tick = {
+        let client = client.clone();
+        move || client.send(Request::Status)
+    };
+    *poll_tick_holder.borrow_mut() = Some(Rc::new(poll_tick.clone()));
+
+    let (system_tx, system_rx) = mpsc::channel();
+    thread::spawn({
+        let closed = closed.clone();
+        move || {
+            while !closed.load(Ordering::Relaxed) {
+                let status = SystemStatus {
+                    video: video_exists(),
+                    busy: video_busy_apps(),
+                    format: v4l2_current_size(),
+                    persistent: boot_persistence_installed(),
+                    mic: mic_ready(),
+                    log: read_log(),
+                };
+                if system_tx.send(status).is_err() {
+                    break;
+                }
+                for _ in 0..20 {
+                    if closed.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    });
+
+    glib::timeout_add_local(Duration::from_millis(80), {
         let state = state.clone();
-        let launch_stream = launch_stream.clone();
+        let client = client.clone();
         let sync_ui = sync_ui.clone();
         let refresh_fps_model = refresh_fps_model.clone();
         let show_toast = show_toast.clone();
-        let reconnect_cancel = reconnect_cancel.clone();
-        let reconnect_in_flight = reconnect_in_flight.clone();
+        let window = window.downgrade();
+        let closed = closed.clone();
         move || {
-            let devs = list_adb_devices();
-            let mut should_auto_start = false;
-            let mut crash_retry: Option<(Option<String>, bool)> = None;
-            let mut probe_target: Option<String> = None;
-
-            {
-                let mut st = state.borrow_mut();
-                st.devices = devs;
-
-                // Record ready devices to history
-                let ready_devs: Vec<(String, String, bool)> = st
-                    .devices
-                    .iter()
-                    .filter(|d| d.state == "device")
-                    .map(|d| (d.serial.clone(), d.model.clone(), d.is_wifi))
-                    .collect();
-                for (ser, model, is_wifi) in ready_devs {
-                    st.cfg.record_device(
-                        &ser,
-                        &model,
-                        is_wifi,
-                        if is_wifi { Some(&ser) } else { None },
-                    );
-                    save_config(&st.cfg);
+            if closed.load(Ordering::Relaxed) || window.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
+            let mut changed = false;
+            while let Ok((revision, result)) = session_rx.try_recv() {
+                if revision != client.revision.get() {
+                    continue;
                 }
-
-                // Phone auto-rotate sync
-                if st.cfg.auto_rotate {
-                    if let Some(ser) = st.selected_serial.clone() {
-                        let is_ready = st
-                            .devices
-                            .iter()
-                            .any(|d| d.serial == ser && d.state == "device");
-                        if is_ready {
-                            if let Some(deg) = get_device_orientation(&ser) {
-                                let prev = st.last_detected_orientation;
-                                if prev != Some(deg) {
-                                    st.last_detected_orientation = Some(deg);
-                                    let opt_rot = optimal_camera_rotation(&st.cfg.camera_id, deg);
-                                    if st.cfg.rotation != opt_rot {
-                                        st.cfg.rotation = opt_rot.to_string();
-                                        save_config(&st.cfg);
-                                        if st.stream.is_some() {
-                                            crash_retry = Some((None, false));
-                                        }
-                                    }
-                                }
-                            }
+                match result {
+                    Ok(snapshot) => {
+                        let mut st = state.borrow_mut();
+                        if st.session == snapshot {
+                            continue;
                         }
-                    }
-                }
-
-                // Auto-reconnect to remembered devices if idle
-                let has_ready_device = st.devices.iter().any(|d| d.state == "device");
-                if st.user_stopped
-                    || !st.cfg.auto_reconnect
-                    || has_ready_device
-                    || st.stream.is_some()
-                {
-                    reconnect_cancel.store(true, Ordering::Relaxed);
-                } else {
-                    reconnect_cancel.store(false, Ordering::Relaxed);
-                }
-                if st.cfg.auto_reconnect
-                    && !has_ready_device
-                    && st.stream.is_none()
-                    && !st.user_stopped
-                    && !reconnect_in_flight.load(Ordering::Relaxed)
-                {
-                    let now = Instant::now();
-                    let should_check = match st.last_history_reconnect_attempt {
-                        None => true,
-                        Some(t) => now.duration_since(t) > Duration::from_secs(8),
-                    };
-                    if should_check {
-                        st.last_history_reconnect_attempt = Some(now);
-                        reconnect_in_flight.store(true, Ordering::Relaxed);
-                        let hist = st.cfg.history.clone();
-                        let cancel = reconnect_cancel.clone();
-                        let in_flight = reconnect_in_flight.clone();
-                        thread::spawn(move || {
-                            let _ = try_auto_reconnect_history(&hist, || {
-                                !cancel.load(Ordering::Relaxed)
+                        st.devices = snapshot.devices.clone();
+                        let valid = st
+                            .selected_serial
+                            .as_ref()
+                            .is_some_and(|serial| st.devices.iter().any(|d| &d.serial == serial));
+                        if !valid {
+                            st.selected_serial = snapshot.serial.clone().or_else(|| {
+                                st.devices
+                                    .iter()
+                                    .find(|d| d.state == "device")
+                                    .or_else(|| st.devices.first())
+                                    .map(|d| d.serial.clone())
                             });
-                            in_flight.store(false, Ordering::Relaxed);
-                        });
-                    }
-                }
-
-                // Keep selected_serial valid or pick best ready device
-                let valid = st
-                    .selected_serial
-                    .as_ref()
-                    .is_some_and(|s| st.devices.iter().any(|d| &d.serial == s));
-                if !valid {
-                    st.selected_serial = st
-                        .devices
-                        .iter()
-                        .find(|d| d.state == "device")
-                        .or_else(|| st.devices.first())
-                        .map(|d| d.serial.clone());
-                }
-
-                // Probe cameras once per connected phone
-                if let Some(sel) = st.selected_serial.clone() {
-                    if st.probed_serial.as_deref() != Some(sel.as_str())
-                        && st
-                            .devices
+                        }
+                        st.back_has_high_speed = snapshot
+                            .cameras
                             .iter()
-                            .any(|d| d.serial == sel && d.state == "device")
-                    {
-                        st.probed_serial = Some(sel.clone());
-                        probe_target = Some(sel);
+                            .find(|c| c.id == "0")
+                            .is_none_or(|c| c.has_high_speed);
+                        st.cfg = snapshot.cfg.clone();
+                        st.session = snapshot;
+                        changed = true;
                     }
-                }
-
-                // USB auto-start edge detection
-                let usb_ready = st
-                    .devices
-                    .iter()
-                    .find(|d| !d.is_wifi && d.state == "device")
-                    .map(|d| d.serial.clone());
-                if let Some(usb_ser) = usb_ready {
-                    if !st.last_usb_seen
-                        && st.cfg.auto_start_usb
-                        && st.stream.is_none()
-                        && read_external_pid().is_none()
-                        && !st.user_stopped
-                        && video_exists()
-                    {
-                        st.selected_serial = Some(usb_ser.clone());
-                        st.auto_started_usb_serial = Some(usb_ser);
-                        should_auto_start = true;
-                    }
-                    st.last_usb_seen = true;
-                } else {
-                    st.last_usb_seen = false;
-                }
-
-                // Supervise active stream
-                let mut crashed_info: Option<(Instant, String, bool)> = None;
-                if let Some(handle) = st.stream.as_mut() {
-                    if let Ok(Some(status)) = handle.child.try_wait() {
-                        let started = handle.started_at;
-                        let res = handle.resolution.clone();
-                        let retried = handle.quick_retried;
-                        st.stream = None;
-                        if !status.success() && !st.user_stopped {
-                            crashed_info = Some((started, res, retried));
-                        }
-                    }
-                }
-
-                if let Some((started, res, retried)) = crashed_info {
-                    let log = read_log();
-                    if let Some(reason) = classify_crash(&log) {
-                        show_toast(reason);
-                    } else if st.cfg.auto_reconnect {
-                        if ran_long_enough(started) || !retried {
-                            crash_retry = Some((Some(res), true));
-                        } else if let Some(fb) = next_fallback_resolution(&res) {
-                            show_toast(&format!("Falling back to {fb}"));
-                            st.cfg.resolution = fb.to_string();
-                            save_config(&st.cfg);
-                            crash_retry = Some((Some(fb.to_string()), false));
-                        } else {
-                            show_toast("Stream failed. Check System -> Logs.");
-                        }
-                    }
-                }
-
-                if let Some(at) = st.reconnect_at {
-                    if st.cfg.auto_reconnect
-                        && Instant::now() >= at
-                        && st.stream.is_none()
-                        && !st.user_stopped
-                    {
-                        st.reconnect_at = None;
-                        crash_retry = Some((None, false));
+                    Err(error) => {
+                        show_toast(&error);
+                        let mut st = state.borrow_mut();
+                        st.session.phase = "failed".into();
+                        st.session.error = Some(error);
+                        changed = true;
                     }
                 }
             }
-
-            if let Some(ser) = probe_target {
-                let cams = probe_cameras(&ser);
-                if let Some(back) = cams.iter().find(|c| c.id == "0") {
-                    state.borrow_mut().back_has_high_speed = back.has_high_speed;
-                    refresh_fps_model();
+            while let Ok(system) = system_rx.try_recv() {
+                let mut st = state.borrow_mut();
+                if st.system != system {
+                    st.system = system;
+                    changed = true;
                 }
             }
-
-            if should_auto_start {
-                show_toast("USB phone detected — starting camera");
-                launch_stream(None, false);
-            } else if let Some((res, retried)) = crash_retry {
-                launch_stream(res.as_deref(), retried);
+            if changed {
+                refresh_fps_model();
+                sync_ui();
             }
-
-            sync_ui();
-        }
-    };
-
-    *poll_tick_holder.borrow_mut() = Some(Rc::new(poll_tick.clone()));
-
-    poll_tick();
-
-    glib::timeout_add_local(Duration::from_millis(1500), {
-        let poll_tick = poll_tick.clone();
-        move || {
-            poll_tick();
             glib::ControlFlow::Continue
         }
     });
+    sync_ui();
 
     // Battery queries have a separate cadence and never run on the GTK thread.
     let mut battery_selection: Option<String> = None;
@@ -1072,8 +1041,9 @@ pub fn build_ui(app: &adw::Application) {
     glib::timeout_add_local(Duration::from_millis(250), {
         let state = state.clone();
         let window = window.downgrade();
+        let closed = closed.clone();
         move || {
-            if window.upgrade().is_none() {
+            if closed.load(Ordering::Relaxed) || window.upgrade().is_none() {
                 return glib::ControlFlow::Break;
             }
             let selected = {
@@ -1140,19 +1110,14 @@ pub fn build_ui(app: &adw::Application) {
     let apply_setting_change = {
         let state = state.clone();
         let updating_ui = updating_ui.clone();
-        let launch_stream = launch_stream.clone();
+        let client = client.clone();
         let sync_ui = sync_ui.clone();
         move || {
-            {
-                if updating_ui.get() {
-                    return;
-                }
-                save_config(&state.borrow().cfg);
+            if updating_ui.get() {
+                return;
             }
-            let live = state.borrow().stream.is_some() || read_external_pid().is_some();
-            if live {
-                launch_stream(None, false);
-            }
+            let changes = state.borrow_mut().pending_changes();
+            client.send(Request::Configure { changes });
             sync_ui();
         }
     };
@@ -1162,26 +1127,21 @@ pub fn build_ui(app: &adw::Application) {
         let state = state.clone();
         let launch_stream = launch_stream.clone();
         let sync_ui = sync_ui.clone();
-        let reconnect_cancel = reconnect_cancel.clone();
+        let client = client.clone();
         move |_| {
-            let live = state.borrow().stream.is_some() || read_external_pid().is_some();
-            if live {
-                reconnect_cancel.store(true, Ordering::Relaxed);
-                {
-                    let mut st = state.borrow_mut();
-                    st.user_stopped = true;
-                    st.reconnect_at = None;
-                    if let Some(mut h) = st.stream.take() {
-                        let _ = h.child.kill();
-                        let _ = h.child.wait();
-                    }
-                }
-                stop_all_streams();
-                sync_ui();
+            let active = {
+                let st = state.borrow();
+                st.session.desired || st.session.pid.is_some()
+            };
+            if active {
+                client.send(Request::Stop);
+                let mut st = state.borrow_mut();
+                st.session.desired = false;
+                st.session.phase = "stopping".into();
             } else {
-                launch_stream(None, false);
-                sync_ui();
+                launch_stream();
             }
+            sync_ui();
         }
     });
 
@@ -1299,24 +1259,28 @@ pub fn build_ui(app: &adw::Application) {
         let state = state.clone();
         let updating_ui = updating_ui.clone();
         let zoom_row = zoom_row.clone();
+        let apply_setting_change = apply_setting_change.clone();
+        let pending = Rc::new(RefCell::new(None::<glib::SourceId>));
         move |sc| {
             let v = (sc.value() * 2.0).round() / 2.0;
             zoom_row.set_subtitle(&format!("{v:.1}x"));
             if !updating_ui.get() {
                 state.borrow_mut().cfg.zoom = v;
-                save_config(&state.borrow().cfg);
+                if let Some(timer) = pending.borrow_mut().take() {
+                    timer.remove();
+                }
+                let apply = apply_setting_change.clone();
+                let finished = pending.clone();
+                *pending.borrow_mut() = Some(glib::timeout_add_local_once(
+                    Duration::from_millis(250),
+                    move || {
+                        finished.borrow_mut().take();
+                        apply();
+                    },
+                ));
             }
         }
     });
-    // Restart on zoom drag release / click if live
-    let zoom_gesture = gtk4::GestureClick::new();
-    zoom_gesture.connect_released({
-        let apply_setting_change = apply_setting_change.clone();
-        move |_, _, _, _| {
-            apply_setting_change();
-        }
-    });
-    zoom_scale.add_controller(zoom_gesture);
 
     torch_row.connect_active_notify({
         let state = state.clone();
@@ -1421,6 +1385,7 @@ pub fn build_ui(app: &adw::Application) {
         let poll_tick = poll_tick.clone();
         let show_toast = show_toast.clone();
         let ip_row = ip_row.clone();
+        let client = client.clone();
         move |_| {
             let sel = {
                 let st = state.borrow();
@@ -1430,29 +1395,49 @@ pub fn build_ui(app: &adw::Application) {
                     .cloned()
             };
             let Some(dev) = sel else { return };
-            if dev.is_wifi {
-                match disconnect_wifi(&dev.serial) {
-                    Ok(()) => show_toast("Disconnected Wi-Fi device"),
-                    Err(e) => show_toast(&e),
-                }
-                poll_tick();
+            let state = state.clone();
+            let client = client.clone();
+            let ip_row = ip_row.clone();
+            let show_toast = show_toast.clone();
+            let poll_tick = poll_tick.clone();
+            let was_wifi = dev.is_wifi;
+            let model = dev.model.clone();
+            let usb_serial = dev.serial.clone();
+            show_toast(if was_wifi {
+                "Disconnecting Wi-Fi..."
             } else {
-                show_toast("Switching phone to Wi-Fi...");
-                match switch_usb_to_wifi(&dev.serial, 5555) {
-                    Ok(ep) => {
-                        {
+                "Switching phone to Wi-Fi..."
+            });
+            background(
+                move || {
+                    if was_wifi {
+                        disconnect_wifi(&dev.serial).map(|_| None)
+                    } else {
+                        switch_usb_to_wifi(&dev.serial, 5555)
+                            .map(|ep| Some((ep, model, usb_serial)))
+                    }
+                },
+                move |result| {
+                    match result {
+                        Ok(Some((ep, model, usb_serial))) => {
                             let mut st = state.borrow_mut();
                             st.cfg.wireless_ip = ep.clone();
+                            st.session.cfg.wireless_ip = ep.clone();
                             st.selected_serial = Some(ep.clone());
-                            save_config(&st.cfg);
+                            client.send(Request::WifiEndpoint {
+                                endpoint: ep.clone(),
+                                model,
+                                switch_from: Some(usb_serial),
+                            });
+                            ip_row.set_text(&ep);
+                            show_toast(&format!("Wi-Fi connected ({ep}) - safe to unplug USB"));
                         }
-                        ip_row.set_text(&ep);
-                        show_toast(&format!("Wi-Fi connected ({ep}) - safe to unplug USB"));
+                        Ok(None) => show_toast("Disconnected Wi-Fi device"),
+                        Err(e) => show_toast(&e),
                     }
-                    Err(e) => show_toast(&e),
-                }
-                poll_tick();
-            }
+                    poll_tick();
+                },
+            );
         }
     });
 
@@ -1460,34 +1445,48 @@ pub fn build_ui(app: &adw::Application) {
         let state = state.clone();
         let poll_tick = poll_tick.clone();
         let show_toast = show_toast.clone();
+        let client = client.clone();
         move |entry| {
             let txt = entry.text().to_string();
             if txt.trim().is_empty() {
                 return;
             }
-            match connect_wifi(&txt) {
-                Ok(ep) => {
-                    {
-                        let mut st = state.borrow_mut();
-                        st.cfg.wireless_ip = ep.clone();
-                        st.selected_serial = Some(ep.clone());
-                        save_config(&st.cfg);
+            let state = state.clone();
+            let client = client.clone();
+            let show_toast = show_toast.clone();
+            let poll_tick = poll_tick.clone();
+            background(
+                move || connect_wifi(&txt),
+                move |result| {
+                    match result {
+                        Ok(ep) => {
+                            let mut st = state.borrow_mut();
+                            st.cfg.wireless_ip = ep.clone();
+                            st.session.cfg.wireless_ip = ep.clone();
+                            st.selected_serial = Some(ep.clone());
+                            client.send(Request::WifiEndpoint {
+                                endpoint: ep.clone(),
+                                model: String::new(),
+                                switch_from: None,
+                            });
+                            show_toast(&format!("Connected to {ep}"));
+                        }
+                        Err(e) => show_toast(&e),
                     }
-                    show_toast(&format!("Connected to {ep}"));
                     poll_tick();
-                }
-                Err(e) => show_toast(&e),
-            }
+                },
+            );
         }
     });
 
     auto_usb_row.connect_active_notify({
         let state = state.clone();
         let updating_ui = updating_ui.clone();
+        let apply_setting_change = apply_setting_change.clone();
         move |row| {
             if !updating_ui.get() {
                 state.borrow_mut().cfg.auto_start_usb = row.is_active();
-                save_config(&state.borrow().cfg);
+                apply_setting_change();
             }
         }
     });
@@ -1495,21 +1494,18 @@ pub fn build_ui(app: &adw::Application) {
     auto_reconn_row.connect_active_notify({
         let state = state.clone();
         let updating_ui = updating_ui.clone();
-        let reconnect_cancel = reconnect_cancel.clone();
+        let apply_setting_change = apply_setting_change.clone();
         move |row| {
             if !updating_ui.get() {
-                let active = row.is_active();
-                if !active {
-                    reconnect_cancel.store(true, Ordering::Relaxed);
-                }
-                state.borrow_mut().cfg.auto_reconnect = active;
-                save_config(&state.borrow().cfg);
+                state.borrow_mut().cfg.auto_reconnect = row.is_active();
+                apply_setting_change();
             }
         }
     });
 
     // QR Code pairing dialog
     qr_btn.connect_clicked({
+        let client = client.clone();
         let window = window.clone();
         let state = state.clone();
         let poll_tick = poll_tick.clone();
@@ -1604,6 +1600,7 @@ pub fn build_ui(app: &adw::Application) {
                 let poll_tick = poll_tick.clone();
                 let show_toast = show_toast.clone();
                 let ip_row = ip_row.clone();
+                let client = client.clone();
                 move || {
                     while let Ok((msg, done)) = rx.try_recv() {
                         if let Some(res) = done {
@@ -1612,8 +1609,13 @@ pub fn build_ui(app: &adw::Application) {
                                     {
                                         let mut st = state.borrow_mut();
                                         st.cfg.wireless_ip = addr.clone();
+                                        st.session.cfg.wireless_ip = addr.clone();
                                         st.selected_serial = Some(addr.clone());
-                                        save_config(&st.cfg);
+                                        client.send(Request::WifiEndpoint {
+                                            endpoint: addr.clone(),
+                                            model: String::new(),
+                                            switch_from: None,
+                                        });
                                     }
                                     ip_row.set_text(&addr);
                                     show_toast(&format!("Paired & connected to {addr}"));
@@ -1648,11 +1650,18 @@ pub fn build_ui(app: &adw::Application) {
         let sync_ui = sync_ui.clone();
         let show_toast = show_toast.clone();
         move |reload: bool| {
-            match load_or_reload_v4l2(reload) {
-                Ok(()) => show_toast("AvyxCam (/dev/video0) ready"),
-                Err(e) => show_toast(&e),
-            }
-            sync_ui();
+            let show_toast = show_toast.clone();
+            let sync_ui = sync_ui.clone();
+            background(
+                move || load_or_reload_v4l2(reload),
+                move |result| {
+                    match result {
+                        Ok(()) => show_toast("AvyxCam (/dev/video0) ready"),
+                        Err(e) => show_toast(&e),
+                    }
+                    sync_ui();
+                },
+            );
         }
     };
     fix_v4l2_inline_btn.connect_clicked({
@@ -1668,11 +1677,15 @@ pub fn build_ui(app: &adw::Application) {
         let sync_ui = sync_ui.clone();
         let show_toast = show_toast.clone();
         move |_| {
-            match install_boot_persistence() {
-                Ok(()) => show_toast("Boot persistence installed"),
-                Err(e) => show_toast(&e),
-            }
-            sync_ui();
+            let show_toast = show_toast.clone();
+            let sync_ui = sync_ui.clone();
+            background(install_boot_persistence, move |result| {
+                match result {
+                    Ok(()) => show_toast("Boot persistence installed"),
+                    Err(e) => show_toast(&e),
+                }
+                sync_ui();
+            });
         }
     });
 
@@ -1680,19 +1693,27 @@ pub fn build_ui(app: &adw::Application) {
         let sync_ui = sync_ui.clone();
         let show_toast = show_toast.clone();
         move |_| {
-            match ensure_virtual_mic() {
-                Ok(()) => show_toast("PhoneMic ready"),
-                Err(e) => show_toast(&e),
-            }
-            sync_ui();
+            let show_toast = show_toast.clone();
+            let sync_ui = sync_ui.clone();
+            background(ensure_virtual_mic, move |result| {
+                match result {
+                    Ok(()) => show_toast("PhoneMic ready"),
+                    Err(e) => show_toast(&e),
+                }
+                sync_ui();
+            });
         }
     });
 
-    // Cleanly handle window close (keep background stream running if preview is off? Stop if preview is on or user wants)
+    // The owner keeps supervising when this client closes.
     window.connect_close_request({
-        let state = state.clone();
+        let camera_preview = camera_preview.clone();
+        let closed = closed.clone();
+        let poll_tick_holder = poll_tick_holder.clone();
         move |_| {
-            let _ = state.borrow();
+            camera_preview.set_session(None, false);
+            closed.store(true, Ordering::Relaxed);
+            poll_tick_holder.borrow_mut().take();
             glib::Propagation::Proceed
         }
     });

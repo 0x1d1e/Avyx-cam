@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceHistory {
@@ -28,7 +27,7 @@ fn default_fps() -> String {
     "30".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
     pub camera_id: String,
@@ -80,12 +79,10 @@ impl AppConfig {
         is_wifi: bool,
         address: Option<&str>,
     ) {
-        let now = Command::new("date")
-            .args(["+%Y-%m-%d %H:%M"])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|| "Recently".to_string());
+        let now = gtk4::glib::DateTime::now_local()
+            .and_then(|date| date.format("%Y-%m-%d %H:%M"))
+            .map(|date| date.to_string())
+            .unwrap_or_else(|_| "Recently".to_string());
 
         let addr = address
             .unwrap_or(if is_wifi { serial } else { "" })
@@ -135,6 +132,39 @@ impl AppConfig {
         self.history
             .retain(|d| d.serial != serial && d.address != serial);
     }
+}
+
+/// Field-level settings update. Clients send only what the user changed, so
+/// concurrent clients cannot overwrite each other's unrelated settings.
+pub type Changes = serde_json::Map<String, serde_json::Value>;
+
+fn config_object(cfg: &AppConfig) -> Changes {
+    match serde_json::to_value(cfg) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => Changes::new(),
+    }
+}
+
+/// Settings changed from `base` to `next`. History is owned by the session owner.
+pub fn diff(base: &AppConfig, next: &AppConfig) -> Changes {
+    let base = config_object(base);
+    config_object(next)
+        .into_iter()
+        .filter(|(key, value)| key != "history" && base.get(key) != Some(value))
+        .collect()
+}
+
+pub fn apply_changes(cfg: &mut AppConfig, changes: &Changes) -> Result<(), String> {
+    let mut object = config_object(cfg);
+    for (key, value) in changes {
+        if key == "history" || !object.contains_key(key) {
+            return Err(format!("Unknown or read-only setting: {key}"));
+        }
+        object.insert(key.clone(), value.clone());
+    }
+    *cfg = serde_json::from_value(serde_json::Value::Object(object))
+        .map_err(|e| format!("Invalid setting: {e}"))?;
+    Ok(())
 }
 
 pub fn config_path() -> PathBuf {
