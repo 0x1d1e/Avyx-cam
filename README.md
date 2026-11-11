@@ -25,7 +25,7 @@ No Android app installation required. Uses native Android ADB media streaming vi
 
 ### Linux System Dependencies
 
-- **scrcpy** (>= 2.0 recommended)
+- **scrcpy** with camera capture and `--capture-orientation` support (use a current upstream release)
 - **android-tools** (`adb`)
 - **v4l2loopback** kernel module
 - **pipewire** / **pipewire-pulse**
@@ -37,13 +37,8 @@ sudo pacman -S scrcpy android-tools v4l2loopback-dkms libadwaita gtk4 qrencode
 ```
 
 #### Ubuntu / Debian / Fedora
-```bash
-# Ubuntu / Debian
-sudo apt install scrcpy adb v4l2loopback-dkms libadwaita-1-dev libgtk-4-dev qrencode
 
-# Fedora
-sudo dnf install scrcpy android-tools v4l2loopback libadwaita-devel gtk4-devel qrencode
-```
+These distributions need prerequisites before `./install.sh --install-deps`: Ubuntu/Debian need current upstream scrcpy; Fedora needs scrcpy from COPR and `akmod-v4l2loopback` from RPM Fusion Free. Follow the [distribution setup instructions](docs/installation.md#install). Ubuntu 24.04's packaged scrcpy is too old for camera streaming.
 
 ---
 
@@ -55,15 +50,13 @@ sudo dnf install scrcpy android-tools v4l2loopback libadwaita-devel gtk4-devel q
    ```
    *(Or click "Install" in Avyx-cam System tab to make it load automatically on boot).*
 
-2. **Run Avyx-cam**:
+2. **Build and install Avyx-cam** from the downloaded source:
    ```bash
-   cargo run --release
+   ./install.sh --install-deps
    ```
-   Or install to `~/.local/bin`:
-   ```bash
-   cargo build --release
-   cp target/release/avyx-cam ~/.local/bin/avyx-cam
-   ```
+   Already have the dependencies? Use `./install.sh`. This builds with Cargo, installs to `~/.local/bin`, and adds the application-menu launcher. Python/uv is not required.
+
+   Open **Avyx-cam** from the application menu. See [installation details](docs/installation.md) for supported package managers, custom paths, updates, and removal. Downloading source alone does not run a build; prebuilt release downloads are planned.
 
 ---
 
@@ -79,7 +72,7 @@ See the complete **[Connection Guide](docs/connection.md)** for detailed walkthr
 
 ## Command Line Interface (CLI)
 
-Avyx-cam includes CLI commands for scripting and keyboard shortcuts:
+Avyx-cam includes CLI commands for scripting and keyboard shortcuts (ensure `~/.local/bin` is on your `PATH`, or run `~/.local/bin/avyx-cam`):
 
 ```bash
 avyx-cam                 # Launch GTK4 control center
