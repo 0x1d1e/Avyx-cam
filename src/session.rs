@@ -60,6 +60,19 @@ pub struct Snapshot {
     pub devices: Vec<AdbDevice>,
     pub cameras: Vec<CameraInfo>,
     pub cfg: AppConfig,
+    /// Pending USB -> Wi-Fi rebind `(from, to)`. Owner-private so an in-flight
+    /// worker cannot overwrite a handoff that arrived while it was starting.
+    #[serde(skip)]
+    pub handoff: Option<(String, String)>,
+}
+impl Snapshot {
+    /// Serial to publish for a device the worker is using, honoring a pending handoff.
+    fn bound_serial(&self, used: &str) -> String {
+        match &self.handoff {
+            Some((from, to)) if from == used => to.clone(),
+            _ => used.to_string(),
+        }
+    }
 }
 impl Default for Snapshot {
     fn default() -> Self {
@@ -73,6 +86,7 @@ impl Default for Snapshot {
             devices: vec![],
             cameras: vec![],
             cfg: AppConfig::default(),
+            handoff: None,
         }
     }
 }
@@ -83,9 +97,9 @@ const LIMIT: usize = 262_144;
 fn stop_latch(dir: &std::path::Path) -> PathBuf {
     dir.join("user-stopped")
 }
-fn persist_stop_latch(dir: &std::path::Path, stopped: bool) {
+fn persist_stop_latch(dir: &std::path::Path, stopped: bool) -> Result<(), String> {
     let path = stop_latch(dir);
-    let result = if stopped {
+    if stopped {
         OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -99,10 +113,8 @@ fn persist_stop_latch(dir: &std::path::Path, stopped: bool) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
-    };
-    if let Err(error) = result {
-        eprintln!("Cannot persist Stop state: {error}");
     }
+    .map_err(|e| format!("Cannot persist Stop state: {e}"))
 }
 
 pub fn runtime_dir() -> Result<PathBuf, String> {
@@ -279,6 +291,7 @@ pub fn run_owner() -> Result<(), String> {
             }
             let request: Request = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
             let stopping = matches!(request, Request::Stop);
+            let mut stop_error = None;
             {
                 let mut s = state.lock().unwrap();
                 match request {
@@ -286,7 +299,8 @@ pub fn run_owner() -> Result<(), String> {
                     Request::Stop => {
                         s.desired = false;
                         s.user_stopped = true;
-                        persist_stop_latch(&dir, true);
+                        s.handoff = None;
+                        stop_error = persist_stop_latch(&dir, true).err();
                         s.phase = "stopping".into();
                         s.error = None;
                         generation.fetch_add(1, Ordering::SeqCst);
@@ -294,12 +308,14 @@ pub fn run_owner() -> Result<(), String> {
                     Request::Start { serial, changes } => {
                         let mut cfg = s.cfg.clone();
                         apply_changes(&mut cfg, &changes)?;
+                        // A latch that cannot be cleared would make a restart ignore Start.
+                        persist_stop_latch(&dir, false)?;
                         save_config(&cfg);
                         s.serial = serial;
+                        s.handoff = None;
                         s.cfg = cfg;
                         s.desired = true;
                         s.user_stopped = false;
-                        persist_stop_latch(&dir, false);
                         s.error = None;
                         s.phase = "starting".into();
                         generation.fetch_add(1, Ordering::SeqCst);
@@ -315,8 +331,12 @@ pub fn run_owner() -> Result<(), String> {
                         save_config(&s.cfg);
                         // Rebind without interrupting the healthy USB stream. After the
                         // cable is unplugged the normal retry path resumes on Wi-Fi.
-                        if s.desired && switch_from.is_some() && s.serial == switch_from {
-                            s.serial = Some(endpoint);
+                        if let (true, Some(from)) = (s.desired, switch_from) {
+                            if s.serial.as_ref() == Some(&from) {
+                                s.serial = Some(endpoint.clone());
+                            }
+                            // Also covers a worker still probing or launching on USB.
+                            s.handoff = Some((from, endpoint));
                         }
                     }
                     Request::Forget { serial } => {
@@ -350,6 +370,9 @@ pub fn run_owner() -> Result<(), String> {
                 if state.lock().unwrap().phase == "stopping" {
                     return Err("Stream cleanup has not completed".into());
                 }
+            }
+            if let Some(error) = stop_error {
+                return Err(format!("Stopped, but not durably: {error}"));
             }
             Ok(state.lock().unwrap().clone())
         })();
@@ -494,6 +517,7 @@ fn worker(state: Arc<Mutex<Snapshot>>, generation: Arc<AtomicU64>) {
                     && cfg.auto_start_usb
                 {
                     s.serial = usb.clone();
+                    s.handoff = None;
                     s.desired = true;
                     s.phase = "starting".into();
                 }
@@ -604,7 +628,7 @@ fn worker(state: Arc<Mutex<Snapshot>>, generation: Arc<AtomicU64>) {
                             return Err("Operation cancelled".into());
                         }
                         s.devices = devices.clone();
-                        s.serial = Some(device.serial.clone());
+                        s.serial = Some(s.bound_serial(&device.serial));
                         s.cfg.record_device(
                             &device.serial,
                             &device.model,
@@ -641,7 +665,7 @@ fn worker(state: Arc<Mutex<Snapshot>>, generation: Arc<AtomicU64>) {
                 Ok(h) => {
                     s.cfg.resolution = h.resolution.clone();
                     s.pid = Some(h.child.id());
-                    s.serial = Some(h.serial.clone());
+                    s.serial = Some(s.bound_serial(&h.serial));
                     s.phase = "streaming".into();
                     s.error = None;
                     handle = Some(h);

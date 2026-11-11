@@ -64,6 +64,19 @@ impl Fixture {
     fn cli(&self, arg: &str) -> Output {
         self.command().arg(arg).output().unwrap()
     }
+    fn try_request(&self, request: Value) -> Value {
+        let mut socket = UnixStream::connect(self.socket_path()).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(6)))
+            .unwrap();
+        socket
+            .write_all(&serde_json::to_vec(&request).unwrap())
+            .unwrap();
+        socket.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut data = Vec::new();
+        socket.read_to_end(&mut data).unwrap();
+        serde_json::from_slice(&data).unwrap()
+    }
     fn request(&self, request: Value) -> Value {
         let mut socket = UnixStream::connect(self.socket_path()).unwrap();
         socket
@@ -198,6 +211,87 @@ fn stop_survives_owner_restart_and_blocks_usb_autostart_until_explicit_start() {
     f.wait_for(|| UnixStream::connect(f.socket_path()).is_err());
     assert!(f.cli("status").status.success());
     assert_eq!(f.request(json!("Status"))["user_stopped"], false);
+}
+
+#[test]
+fn stop_and_start_report_latch_io_failures() {
+    let f = Fixture::new(false);
+    f.tool("adb", "printf 'List of devices attached\\n'");
+    assert!(f.cli("status").status.success());
+    // A directory in place of the marker makes both create and remove fail.
+    let latch = f.root.join("avyx-cam/user-stopped");
+    fs::create_dir(&latch).unwrap();
+    let reply = f.try_request(json!("Stop"));
+    assert!(
+        reply["Err"].as_str().is_some_and(|e| e.contains("durably")),
+        "{reply}"
+    );
+    // The in-memory Stop still applies.
+    assert_eq!(f.request(json!("Status"))["user_stopped"], true);
+    let reply = f.try_request(json!({"Start":{"serial":null,"changes":{}}}));
+    assert!(
+        reply["Err"]
+            .as_str()
+            .is_some_and(|e| e.contains("Cannot persist")),
+        "{reply}"
+    );
+    let status = f.request(json!("Status"));
+    assert_eq!(status["desired"], false);
+    assert_eq!(status["user_stopped"], true);
+    fs::remove_dir(&latch).unwrap();
+    f.request(json!({"Start":{"serial":null,"changes":{"auto_reconnect":false}}}));
+    assert_eq!(f.request(json!("Status"))["user_stopped"], false);
+}
+
+#[test]
+#[ignore = "requires /dev/video0; use a sandbox placeholder"]
+fn wifi_handoff_during_inflight_usb_start_survives_and_recovers_after_unplug() {
+    let f = streaming_fixture();
+    f.tool(
+        "adb",
+        r#"
+case "$1" in
+ connect) echo "connected to $2" ;;
+ devices)
+  printf 'List of devices attached\n'
+  if [ -f "$AVYX_TEST_ROOT/unplugged" ]; then echo '192.0.2.5:5555 device model:Simulated'
+  else echo 'usb1 device model:Simulated'; echo '192.0.2.5:5555 device model:Simulated'; fi ;;
+esac
+"#,
+    );
+    f.tool(
+        "scrcpy",
+        r#"
+case "$*" in
+ *--list-camera-sizes*)
+  touch "$AVYX_TEST_ROOT/probing"
+  while [ ! -f "$AVYX_TEST_ROOT/release" ]; do sleep 0.05; done
+  exit 0 ;;
+esac
+case "$*" in
+ *usb1*) while [ ! -f "$AVYX_TEST_ROOT/unplugged" ]; do sleep 0.05; done; exit 1 ;;
+esac
+exec sleep 60
+"#,
+    );
+    f.request(json!({"Start":{"serial":"usb1","changes":{"auto_rotate":false,"mic_mode":"off"}}}));
+    // The worker is now stuck probing on the USB serial.
+    f.wait_for(|| f.root.join("probing").exists());
+    f.request(json!({"WifiEndpoint":{"endpoint":"192.0.2.5:5555","model":"Simulated","switch_from":"usb1"}}));
+    fs::write(f.root.join("release"), "").unwrap();
+    f.wait_for(|| f.request(json!("Status"))["phase"] == "streaming");
+    assert_eq!(
+        f.request(json!("Status"))["serial"],
+        "192.0.2.5:5555",
+        "In-flight USB start must not overwrite the Wi-Fi handoff"
+    );
+    let usb_pid = f.request(json!("Status"))["pid"].clone();
+    fs::write(f.root.join("unplugged"), "").unwrap();
+    f.wait_for(|| {
+        let s = f.request(json!("Status"));
+        s["phase"] == "streaming" && s["pid"] != usb_pid && s["serial"] == "192.0.2.5:5555"
+    });
+    assert!(f.cli("stop").status.success());
 }
 
 #[test]

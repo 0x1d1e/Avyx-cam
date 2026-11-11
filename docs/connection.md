@@ -51,7 +51,7 @@ If your phone is already connected via USB:
 
 1. Plug phone via USB.
 2. When prompted on phone, tap **Allow USB debugging** and check **Always allow from this computer**.
-3. Avyx-cam detects the phone during background discovery. If **Auto-start on USB Plug-in** is enabled, a new USB connection starts streaming unless you previously pressed Stop. A newly started session owner begins idle, even with a phone already connected. Stop is remembered in the per-login runtime directory, so an owner crash or restart does not undo it; logging out or rebooting clears it.
+3. Avyx-cam detects the phone during background discovery. If **Auto-start on USB Plug-in** is enabled, a new USB connection starts streaming unless you previously pressed Stop. A newly started session owner begins idle, even with a phone already connected. Stop is remembered in the per-login runtime directory, so an owner crash or restart does not undo it; logging out or rebooting clears it. If that marker cannot be written, Stop still takes effect but reports an error, because it would not survive an owner crash. An explicit Start fails if the marker cannot be cleared.
 
 ---
 
