@@ -99,3 +99,4 @@ The owner starts on demand and begins idle after a crash. USB auto-start respond
 
 ### Microphone not showing in apps
 - In Discord, Zoom, OBS, or browser settings, select **PhoneMic** or **Monitor of PhoneMic_sink** as your input source.
+- Only one application can read `/dev/video0` at a time. Turn **Live Camera Preview** off before opening the camera in another app, otherwise that app reports the device as busy.

@@ -1,14 +1,10 @@
 //! Read-only, nonblocking v4l2loopback frames and local QR decoding.
 use gtk4::glib;
 use linux_video::{
-    types::{BufferType, PixFormat},
-    Device,
+    types::{BufferType, ContentType, In, Mmap, PixFormat},
+    Device, Stream,
 };
-use std::{
-    fs::{File, OpenOptions},
-    io::Read,
-    os::unix::fs::OpenOptionsExt,
-};
+use std::os::unix::io::AsRawFd;
 
 const MAX_RAW: usize = 32 * 1024 * 1024;
 const MAX_PIXELS: usize = 960 * 720;
@@ -197,10 +193,11 @@ impl Layout {
     }
 }
 
+/// Reads frames with the mmap streaming API. `read()` I/O on v4l2loopback holds
+/// the device exclusively, which would stop other apps from using the webcam.
 pub struct VideoReader {
-    file: File,
+    stream: Stream<In, Mmap>,
     layout: Layout,
-    buffer: Vec<u8>,
 }
 impl VideoReader {
     pub fn open(path: &str) -> Result<Self, String> {
@@ -223,36 +220,35 @@ impl VideoReader {
             stride: pix.bytes_per_line().max(min_stride) as usize,
             fourcc: code,
         };
-        let size = layout.required()?.max(pix.size_image() as usize);
-        if size > MAX_RAW {
+        if layout.required()?.max(pix.size_image() as usize) > MAX_RAW {
             return Err("Camera frame exceeds preview size limit".into());
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-            .map_err(|e| e.to_string())?;
-        Ok(Self {
-            file,
-            layout,
-            buffer: vec![0; size],
-        })
+        // Nonblocking dequeue: the preview thread must never block on a stalled producer.
+        let flags = unsafe { libc::fcntl(device.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(device.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err("Cannot configure camera preview".into());
+        }
+        let stream = device
+            .stream::<In, Mmap>(ContentType::Video, 4)
+            .map_err(|e| format!("Cannot stream camera preview: {e}"))?;
+        Ok(Self { stream, layout })
     }
 
+    /// Nonblocking: returns `Ok(None)` when no new frame is available yet.
     pub fn next_frame(&mut self) -> Result<Option<Frame>, String> {
-        match self.file.read(&mut self.buffer) {
-            Ok(0) => Ok(None),
-            Ok(n) => self.layout.convert(&self.buffer[..n]).map(Some),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(e) => Err(format!("Cannot read camera preview: {e}")),
-        }
+        let buffer = match self.stream.next() {
+            Ok(buffer) => buffer,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => return Err(format!("Cannot read camera preview: {e}")),
+        };
+        let frame = {
+            let data = buffer.lock();
+            self.layout.convert(data.as_ref())
+        };
+        frame.map(Some)
     }
 }
 

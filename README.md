@@ -17,7 +17,7 @@ No Android app installation required. Uses native Android ADB media streaming vi
 - **PipeWire Virtual Microphone**: Low-latency `PhoneMic` source selectable in Zoom, Google Meet, Discord, and OBS.
 - **Full Lens & Hardware Controls**: Front/back switch, zoom slider, flashlight/torch, flip/un-mirror, bitrate, and v4l2 buffering.
 - **Live Preview with QR Links**: The Camera tab shows the live feed. QR codes containing http/https links are detected locally and highlighted. Click one to open it in your PC browser. Credentials in URLs and non-web schemes are ignored.
-- **Background Mode**: Disable live preview to run purely as a headless system webcam.
+- **Background Mode**: v4l2loopback allows one reader at a time, so turn live preview off when Zoom, OBS or a browser should use the camera.
 - **CLI & GUI Modes**: Control completely through the GTK4 GUI or use command-line shortcuts (`avyx-cam back`, `avyx-cam stop`).
 
 ---
