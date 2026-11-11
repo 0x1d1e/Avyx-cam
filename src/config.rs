@@ -134,6 +134,39 @@ impl AppConfig {
     }
 }
 
+/// Field-level settings update. Clients send only what the user changed, so
+/// concurrent clients cannot overwrite each other's unrelated settings.
+pub type Changes = serde_json::Map<String, serde_json::Value>;
+
+fn config_object(cfg: &AppConfig) -> Changes {
+    match serde_json::to_value(cfg) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => Changes::new(),
+    }
+}
+
+/// Settings changed from `base` to `next`. History is owned by the session owner.
+pub fn diff(base: &AppConfig, next: &AppConfig) -> Changes {
+    let base = config_object(base);
+    config_object(next)
+        .into_iter()
+        .filter(|(key, value)| key != "history" && base.get(key) != Some(value))
+        .collect()
+}
+
+pub fn apply_changes(cfg: &mut AppConfig, changes: &Changes) -> Result<(), String> {
+    let mut object = config_object(cfg);
+    for (key, value) in changes {
+        if key == "history" || !object.contains_key(key) {
+            return Err(format!("Unknown or read-only setting: {key}"));
+        }
+        object.insert(key.clone(), value.clone());
+    }
+    *cfg = serde_json::from_value(serde_json::Value::Object(object))
+        .map_err(|e| format!("Invalid setting: {e}"))?;
+    Ok(())
+}
+
 pub fn config_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)

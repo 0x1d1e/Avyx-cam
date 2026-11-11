@@ -51,7 +51,7 @@ If your phone is already connected via USB:
 
 1. Plug phone via USB.
 2. When prompted on phone, tap **Allow USB debugging** and check **Always allow from this computer**.
-3. Avyx-cam detects the phone during background discovery. If **Auto-start on USB Plug-in** is enabled, a new USB connection starts streaming unless you previously pressed Stop. A newly started session owner begins idle, even with a phone already connected.
+3. Avyx-cam detects the phone during background discovery. If **Auto-start on USB Plug-in** is enabled, a new USB connection starts streaming unless you previously pressed Stop. A newly started session owner begins idle, even with a phone already connected. Stop is remembered in the per-login runtime directory, so an owner crash or restart does not undo it; logging out or rebooting clears it.
 
 ---
 
@@ -66,6 +66,10 @@ If your phone is already connected via USB:
 GUI and CLI share one session per Linux user. `avyx-cam back` and `avyx-cam front` work without a graphical display. Closing the GUI leaves the session supervised; reopening it attaches to the same session. Changing camera settings replaces the owned stream in sequence and may interrupt frames.
 
 **Stop** and `avyx-cam stop` cancel pending starts and reconnects as well as the active stream. Unplugging/replugging a phone or enabling Auto-reconnect does not undo Stop. Click Start or run a CLI camera command to resume.
+
+**Concurrent clients:** the GUI and CLI send only the settings they changed, and the owner merges them, so one client cannot overwrite another's unrelated settings. If two clients change the same setting, the last request wins.
+
+**USB to Wi-Fi handoff:** after a successful switch, the owner rebinds the active session to the Wi-Fi endpoint without interrupting the USB stream. When you unplug USB, the stream resumes over Wi-Fi through normal Auto-reconnect.
 
 `avyx-cam status` reports session intent, process state, and errors. A running scrcpy process does not prove that frames reach `/dev/video0` or your meeting app. Authorization, camera privacy, and camera-in-use errors require action on the phone followed by an explicit restart.
 

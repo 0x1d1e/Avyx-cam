@@ -1,5 +1,5 @@
 use crate::battery::{query_battery, BatteryStatus};
-use crate::config::{load_config, AppConfig};
+use crate::config::{diff, load_config, AppConfig};
 use crate::devices::{
     boot_persistence_installed, connect_wifi, disconnect_wifi, ensure_virtual_mic,
     install_boot_persistence, load_or_reload_v4l2, mic_ready, switch_usb_to_wifi,
@@ -28,6 +28,15 @@ struct AppState {
     session: Snapshot,
     system: SystemStatus,
     back_has_high_speed: bool,
+}
+
+impl AppState {
+    /// Only fields this client changed since the owner's last snapshot are sent.
+    fn pending_changes(&mut self) -> crate::config::Changes {
+        let changes = diff(&self.session.cfg, &self.cfg);
+        self.session.cfg = self.cfg.clone();
+        changes
+    }
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -554,9 +563,10 @@ pub fn build_ui(app: &adw::Application) {
         let client = client.clone();
         move || {
             let mut st = state.borrow_mut();
+            let changes = st.pending_changes();
             client.send(Request::Start {
                 serial: st.selected_serial.clone(),
-                cfg: st.cfg.clone(),
+                changes,
             });
             st.session.desired = true;
             st.session.phase = "starting".into();
@@ -904,8 +914,8 @@ pub fn build_ui(app: &adw::Application) {
                     forget_btn.connect_clicked(move |_| {
                         let mut st = state.borrow_mut();
                         st.cfg.forget_device(&del_serial);
-                        client.send(Request::Configure {
-                            cfg: st.cfg.clone(),
+                        client.send(Request::Forget {
+                            serial: del_serial.clone(),
                         });
                     });
                     row.add_suffix(&forget_btn);
@@ -1106,9 +1116,8 @@ pub fn build_ui(app: &adw::Application) {
             if updating_ui.get() {
                 return;
             }
-            client.send(Request::Configure {
-                cfg: state.borrow().cfg.clone(),
-            });
+            let changes = state.borrow_mut().pending_changes();
+            client.send(Request::Configure { changes });
             sync_ui();
         }
     };
@@ -1392,6 +1401,8 @@ pub fn build_ui(app: &adw::Application) {
             let show_toast = show_toast.clone();
             let poll_tick = poll_tick.clone();
             let was_wifi = dev.is_wifi;
+            let model = dev.model.clone();
+            let usb_serial = dev.serial.clone();
             show_toast(if was_wifi {
                 "Disconnecting Wi-Fi..."
             } else {
@@ -1402,17 +1413,21 @@ pub fn build_ui(app: &adw::Application) {
                     if was_wifi {
                         disconnect_wifi(&dev.serial).map(|_| None)
                     } else {
-                        switch_usb_to_wifi(&dev.serial, 5555).map(Some)
+                        switch_usb_to_wifi(&dev.serial, 5555)
+                            .map(|ep| Some((ep, model, usb_serial)))
                     }
                 },
                 move |result| {
                     match result {
-                        Ok(Some(ep)) => {
+                        Ok(Some((ep, model, usb_serial))) => {
                             let mut st = state.borrow_mut();
                             st.cfg.wireless_ip = ep.clone();
+                            st.session.cfg.wireless_ip = ep.clone();
                             st.selected_serial = Some(ep.clone());
-                            client.send(Request::Configure {
-                                cfg: st.cfg.clone(),
+                            client.send(Request::WifiEndpoint {
+                                endpoint: ep.clone(),
+                                model,
+                                switch_from: Some(usb_serial),
                             });
                             ip_row.set_text(&ep);
                             show_toast(&format!("Wi-Fi connected ({ep}) - safe to unplug USB"));
@@ -1447,9 +1462,12 @@ pub fn build_ui(app: &adw::Application) {
                         Ok(ep) => {
                             let mut st = state.borrow_mut();
                             st.cfg.wireless_ip = ep.clone();
+                            st.session.cfg.wireless_ip = ep.clone();
                             st.selected_serial = Some(ep.clone());
-                            client.send(Request::Configure {
-                                cfg: st.cfg.clone(),
+                            client.send(Request::WifiEndpoint {
+                                endpoint: ep.clone(),
+                                model: String::new(),
+                                switch_from: None,
                             });
                             show_toast(&format!("Connected to {ep}"));
                         }
@@ -1591,9 +1609,12 @@ pub fn build_ui(app: &adw::Application) {
                                     {
                                         let mut st = state.borrow_mut();
                                         st.cfg.wireless_ip = addr.clone();
+                                        st.session.cfg.wireless_ip = addr.clone();
                                         st.selected_serial = Some(addr.clone());
-                                        client.send(Request::Configure {
-                                            cfg: st.cfg.clone(),
+                                        client.send(Request::WifiEndpoint {
+                                            endpoint: addr.clone(),
+                                            model: String::new(),
+                                            switch_from: None,
                                         });
                                     }
                                     ip_row.set_text(&addr);

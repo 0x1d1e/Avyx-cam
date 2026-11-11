@@ -1,6 +1,6 @@
 //! Per-user session ownership. Transport accepts intent; one worker owns all stream work.
 use crate::{
-    config::{load_config, save_config, AppConfig},
+    config::{apply_changes, load_config, save_config, AppConfig, Changes},
     devices::{self, AdbDevice, CameraInfo},
     process,
     stream::{self, StreamHandle},
@@ -31,10 +31,21 @@ pub enum Request {
     Status,
     Start {
         serial: Option<String>,
-        cfg: AppConfig,
+        #[serde(default)]
+        changes: Changes,
     },
     Configure {
-        cfg: AppConfig,
+        changes: Changes,
+    },
+    /// A Wi-Fi ADB endpoint is connected. With `switch_from`, an active stream
+    /// bound to that serial is rebound to the endpoint so unplugging USB is safe.
+    WifiEndpoint {
+        endpoint: String,
+        model: String,
+        switch_from: Option<String>,
+    },
+    Forget {
+        serial: String,
     },
     Stop,
 }
@@ -66,6 +77,33 @@ impl Default for Snapshot {
     }
 }
 const LIMIT: usize = 262_144;
+
+// Stop must survive an owner crash within the login session (runtime dir is
+// per-login), otherwise a fresh owner could auto-start without explicit Start.
+fn stop_latch(dir: &std::path::Path) -> PathBuf {
+    dir.join("user-stopped")
+}
+fn persist_stop_latch(dir: &std::path::Path, stopped: bool) {
+    let path = stop_latch(dir);
+    let result = if stopped {
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map(|_| ())
+    } else {
+        match fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    };
+    if let Err(error) = result {
+        eprintln!("Cannot persist Stop state: {error}");
+    }
+}
 
 pub fn runtime_dir() -> Result<PathBuf, String> {
     let uid = unsafe { libc::geteuid() };
@@ -202,6 +240,7 @@ pub fn run_owner() -> Result<(), String> {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
     let state = Arc::new(Mutex::new(Snapshot {
         cfg: load_config(),
+        user_stopped: fs::symlink_metadata(stop_latch(&dir)).is_ok(),
         ..Snapshot::default()
     }));
     let generation = Arc::new(AtomicU64::new(1));
@@ -247,21 +286,46 @@ pub fn run_owner() -> Result<(), String> {
                     Request::Stop => {
                         s.desired = false;
                         s.user_stopped = true;
+                        persist_stop_latch(&dir, true);
                         s.phase = "stopping".into();
                         s.error = None;
                         generation.fetch_add(1, Ordering::SeqCst);
                     }
-                    Request::Start { serial, cfg } => {
+                    Request::Start { serial, changes } => {
+                        let mut cfg = s.cfg.clone();
+                        apply_changes(&mut cfg, &changes)?;
                         save_config(&cfg);
                         s.serial = serial;
                         s.cfg = cfg;
                         s.desired = true;
                         s.user_stopped = false;
+                        persist_stop_latch(&dir, false);
                         s.error = None;
                         s.phase = "starting".into();
                         generation.fetch_add(1, Ordering::SeqCst);
                     }
-                    Request::Configure { cfg } => {
+                    Request::WifiEndpoint {
+                        endpoint,
+                        model,
+                        switch_from,
+                    } => {
+                        s.cfg.wireless_ip = endpoint.clone();
+                        s.cfg
+                            .record_device(&endpoint, &model, true, Some(&endpoint));
+                        save_config(&s.cfg);
+                        // Rebind without interrupting the healthy USB stream. After the
+                        // cable is unplugged the normal retry path resumes on Wi-Fi.
+                        if s.desired && switch_from.is_some() && s.serial == switch_from {
+                            s.serial = Some(endpoint);
+                        }
+                    }
+                    Request::Forget { serial } => {
+                        s.cfg.forget_device(&serial);
+                        save_config(&s.cfg);
+                    }
+                    Request::Configure { changes } => {
+                        let mut cfg = s.cfg.clone();
+                        apply_changes(&mut cfg, &changes)?;
                         let restart = stream_settings(&cfg) != stream_settings(&s.cfg);
                         let cancel_retry =
                             s.cfg.auto_reconnect && !cfg.auto_reconnect && s.pid.is_none();

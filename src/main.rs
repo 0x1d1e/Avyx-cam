@@ -82,16 +82,11 @@ fn handle_cli(cmd: &str) -> i32 {
             println!("Switching {} to Wi-Fi...", u.model);
             match switch_usb_to_wifi(&u.serial, 5555) {
                 Ok(ep) => {
-                    let mut cfg = match request(Request::Status) {
-                        Ok(snapshot) => snapshot.cfg,
-                        Err(error) => {
-                            eprintln!("{error}");
-                            return 1;
-                        }
-                    };
-                    cfg.wireless_ip = ep.clone();
-                    cfg.record_device(&ep, &u.model, true, Some(&ep));
-                    if let Err(error) = request(Request::Configure { cfg }) {
+                    if let Err(error) = request(Request::WifiEndpoint {
+                        endpoint: ep.clone(),
+                        model: u.model.clone(),
+                        switch_from: Some(u.serial.clone()),
+                    }) {
                         eprintln!("{error}");
                         return 1;
                     }
@@ -105,19 +100,15 @@ fn handle_cli(cmd: &str) -> i32 {
             }
         }
         "front" | "back" => {
-            let mut cfg = match request(Request::Status) {
-                Ok(snapshot) => snapshot.cfg,
-                Err(error) => {
-                    eprintln!("{error}");
-                    return 1;
-                }
-            };
-            cfg.camera_id = if cmd == "front" {
-                "1".to_string()
-            } else {
-                "0".to_string()
-            };
-            match request(Request::Start { serial: None, cfg }) {
+            let mut changes = config::Changes::new();
+            changes.insert(
+                "camera_id".into(),
+                if cmd == "front" { "1" } else { "0" }.into(),
+            );
+            match request(Request::Start {
+                serial: None,
+                changes,
+            }) {
                 Ok(_) => {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
                     loop {

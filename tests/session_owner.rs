@@ -145,7 +145,7 @@ fn headless_races_stop_and_crash_recovery() {
     let snapshot = f.request(json!("Status"));
     assert_eq!(snapshot["desired"], false);
     assert_eq!(snapshot["user_stopped"], true);
-    let snapshot = f.request(json!({"Configure":{"cfg":{"auto_start_usb":true}}}));
+    let snapshot = f.request(json!({"Configure":{"changes":{"auto_start_usb":true}}}));
     assert_eq!(snapshot["user_stopped"], true);
     assert_eq!(f.owner_pid(), pid);
     unsafe {
@@ -162,7 +162,111 @@ fn headless_races_stop_and_crash_recovery() {
     let snapshot = f.request(json!("Status"));
     assert_eq!(snapshot["phase"], "idle");
     assert_eq!(snapshot["desired"], false);
-    assert_eq!(snapshot["user_stopped"], false);
+    // Stop survives an owner crash until an explicit Start.
+    assert_eq!(snapshot["user_stopped"], true);
+}
+
+#[test]
+fn stop_survives_owner_restart_and_blocks_usb_autostart_until_explicit_start() {
+    let f = Fixture::new(false);
+    f.tool("adb", "printf 'List of devices attached\\n'");
+    f.tool("scrcpy", "exit 1");
+    assert!(f.cli("status").status.success());
+    f.request(json!({"Configure":{"changes":{"auto_start_usb":true}}}));
+    assert!(f.cli("stop").status.success());
+    unsafe {
+        libc::kill(f.owner_pid(), libc::SIGKILL);
+    }
+    f.wait_for(|| UnixStream::connect(f.socket_path()).is_err());
+    assert!(f.cli("status").status.success());
+    assert_eq!(f.request(json!("Status"))["user_stopped"], true);
+    f.wait_for(|| f.request(json!("Status"))["devices"].as_array().is_some());
+    f.tool(
+        "adb",
+        "printf 'List of devices attached\\nusb1 device model:Simulated\\n'",
+    );
+    std::thread::sleep(Duration::from_millis(2600));
+    let status = f.request(json!("Status"));
+    assert_eq!(status["phase"], "idle");
+    assert_eq!(status["desired"], false);
+    // Explicit Start clears the latch durably.
+    f.request(json!({"Start":{"serial":null,"changes":{"auto_reconnect":false}}}));
+    assert_eq!(f.request(json!("Status"))["user_stopped"], false);
+    unsafe {
+        libc::kill(f.owner_pid(), libc::SIGKILL);
+    }
+    f.wait_for(|| UnixStream::connect(f.socket_path()).is_err());
+    assert!(f.cli("status").status.success());
+    assert_eq!(f.request(json!("Status"))["user_stopped"], false);
+}
+
+#[test]
+fn stale_clients_cannot_overwrite_each_others_settings() {
+    let f = Fixture::new(false);
+    assert!(f.cli("status").status.success());
+    // Client A and B both started from the same snapshot and change different fields.
+    f.request(json!({"Configure":{"changes":{"zoom":2.0}}}));
+    f.request(json!({"Configure":{"changes":{"fps":"15"}}}));
+    let cfg = &f.request(json!("Status"))["cfg"];
+    assert_eq!(cfg["zoom"], 2.0);
+    assert_eq!(cfg["fps"], "15");
+    // Unknown and owner-managed fields are rejected, leaving state untouched.
+    let mut socket = UnixStream::connect(f.socket_path()).unwrap();
+    socket
+        .write_all(br#"{"Configure":{"changes":{"history":[],"bogus":1}}}"#)
+        .unwrap();
+    socket.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = String::new();
+    socket.read_to_string(&mut reply).unwrap();
+    assert!(reply.contains("Err"), "{reply}");
+    assert_eq!(f.request(json!("Status"))["cfg"]["zoom"], 2.0);
+}
+
+#[test]
+#[ignore = "requires /dev/video0; use a sandbox placeholder"]
+fn usb_to_wifi_switch_rebinds_owner_and_recovers_after_unplug() {
+    let f = streaming_fixture();
+    f.tool(
+        "adb",
+        r#"
+case "$1" in
+ connect) echo "connected to $2" ;;
+ devices)
+  printf 'List of devices attached\n'
+  if [ -f "$AVYX_TEST_ROOT/unplugged" ]; then echo '192.0.2.5:5555 device model:Simulated'
+  else echo 'usb1 device model:Simulated'; echo '192.0.2.5:5555 device model:Simulated'; fi ;;
+esac
+"#,
+    );
+    f.tool(
+        "scrcpy",
+        r#"
+case "$*" in
+ *--list-camera-sizes*) exit 0 ;;
+esac
+printf '%s\n' "$*" >> "$AVYX_TEST_ROOT/launches"
+case "$*" in
+ *usb1*) while [ ! -f "$AVYX_TEST_ROOT/unplugged" ]; do sleep 0.05; done; exit 1 ;;
+esac
+exec sleep 60
+"#,
+    );
+    f.request(json!({"Start":{"serial":"usb1","changes":{"auto_rotate":false,"mic_mode":"off"}}}));
+    f.wait_for(|| f.request(json!("Status"))["phase"] == "streaming");
+    let usb_pid = f.request(json!("Status"))["pid"].clone();
+    f.request(json!({"WifiEndpoint":{"endpoint":"192.0.2.5:5555","model":"Simulated","switch_from":"usb1"}}));
+    let status = f.request(json!("Status"));
+    assert_eq!(status["serial"], "192.0.2.5:5555");
+    assert_eq!(
+        status["pid"], usb_pid,
+        "Handoff must not interrupt the healthy stream"
+    );
+    fs::write(f.root.join("unplugged"), "").unwrap();
+    f.wait_for(|| {
+        let s = f.request(json!("Status"));
+        s["phase"] == "streaming" && s["pid"] != usb_pid && s["serial"] == "192.0.2.5:5555"
+    });
+    assert!(f.cli("stop").status.success());
 }
 
 #[test]
@@ -178,7 +282,7 @@ fn stop_cancels_probe_and_never_touches_unrelated_process() {
     );
     let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
     assert!(f.cli("status").status.success());
-    f.request(json!({"Start":{"serial":null,"cfg":{"auto_rotate":false}}}));
+    f.request(json!({"Start":{"serial":null,"changes":{"auto_rotate":false}}}));
     f.wait_for(|| f.root.join("probe.pid").exists());
     let child_pid: i32 = fs::read_to_string(f.root.join("probe.pid"))
         .unwrap()
@@ -201,7 +305,7 @@ fn stop_cancels_probe_and_never_touches_unrelated_process() {
     unrelated.kill().unwrap();
     unrelated.wait().unwrap();
     // Device remains present, but neither USB auto-start nor retries can undo Stop.
-    f.request(json!({"Configure":{"cfg":{"auto_reconnect":true,"auto_start_usb":true}}}));
+    f.request(json!({"Configure":{"changes":{"auto_reconnect":true,"auto_start_usb":true}}}));
     std::thread::sleep(Duration::from_millis(2200));
     let status = f.request(json!("Status"));
     assert_eq!(status["phase"], "idle");
@@ -213,7 +317,7 @@ fn disabling_reconnect_cancels_attempt_and_stop_invalidates_waiting() {
     let f = Fixture::new(false);
     f.tool("adb", "if [ \"$1\" = connect ]; then echo $$ > \"$AVYX_TEST_ROOT/connect.pid\"; exec sleep 30; fi\nprintf 'List of devices attached\\n'");
     assert!(f.cli("status").status.success());
-    f.request(json!({"Start":{"serial":null,"cfg":{"wireless_ip":"192.0.2.1:5555"}}}));
+    f.request(json!({"Start":{"serial":null,"changes":{"wireless_ip":"192.0.2.1:5555"}}}));
     f.wait_for(|| f.root.join("connect.pid").exists());
     let pid: i32 = fs::read_to_string(f.root.join("connect.pid"))
         .unwrap()
@@ -221,12 +325,14 @@ fn disabling_reconnect_cancels_attempt_and_stop_invalidates_waiting() {
         .parse()
         .unwrap();
     let before = Instant::now();
-    f.request(json!({"Configure":{"cfg":{"auto_reconnect":false,"wireless_ip":"192.0.2.1:5555"}}}));
+    f.request(
+        json!({"Configure":{"changes":{"auto_reconnect":false,"wireless_ip":"192.0.2.1:5555"}}}),
+    );
     f.wait_for(|| !PathBuf::from(format!("/proc/{pid}")).exists());
     assert!(before.elapsed() < Duration::from_secs(1));
     assert_eq!(f.request(json!("Status"))["phase"], "failed");
     f.tool("adb", "printf 'List of devices attached\\n'");
-    f.request(json!({"Start":{"serial":null,"cfg":{}}}));
+    f.request(json!({"Start":{"serial":null,"changes":{"auto_reconnect":true}}}));
     f.wait_for(|| f.request(json!("Status"))["phase"] == "waiting");
     assert!(f.cli("stop").status.success());
     std::thread::sleep(Duration::from_millis(1200));
@@ -317,7 +423,7 @@ fn fallback_is_private_and_stop_cancels_hung_discovery() {
             & 0o777,
         0o700
     );
-    f.request(json!({"Start":{"serial":null,"cfg":{}}}));
+    f.request(json!({"Start":{"serial":null,"changes":{}}}));
     let before = Instant::now();
     assert!(f.cli("stop").status.success());
     assert!(before.elapsed() < Duration::from_secs(1));
@@ -357,8 +463,8 @@ exec sleep 60
 fn streaming_replacements_are_serial_and_forced_stop_is_bounded() {
     let f = streaming_fixture();
     fs::write(f.root.join("ignore-term"), "").unwrap();
-    let start = json!({"Start":{"serial":null,"cfg":{"auto_rotate":false,"mic_mode":"off"}}});
-    f.request(json!({"Configure":{"cfg":{"auto_rotate":false,"mic_mode":"off"}}}));
+    let start = json!({"Start":{"serial":null,"changes":{"auto_rotate":false,"mic_mode":"off"}}});
+    f.request(json!({"Configure":{"changes":{"auto_rotate":false,"mic_mode":"off"}}}));
     let headless = f.cli("back");
     assert!(
         headless.status.success(),
@@ -401,7 +507,7 @@ fn streaming_replacements_are_serial_and_forced_stop_is_bounded() {
         1
     );
     f.request(
-        json!({"Configure":{"cfg":{"auto_rotate":false,"mic_mode":"off","auto_reconnect":false}}}),
+        json!({"Configure":{"changes":{"auto_rotate":false,"mic_mode":"off","auto_reconnect":false}}}),
     );
     assert_eq!(f.request(json!("Status"))["pid"], active);
     let before = Instant::now();
@@ -420,7 +526,7 @@ fn streaming_replacements_are_serial_and_forced_stop_is_bounded() {
 #[ignore = "requires /dev/video0; use a sandbox placeholder"]
 fn active_owner_death_kills_stream_and_restart_stays_idle_with_usb_autostart() {
     let f = streaming_fixture();
-    f.request(json!({"Start":{"serial":null,"cfg":{"auto_rotate":false,"mic_mode":"off","auto_start_usb":true}}}));
+    f.request(json!({"Start":{"serial":null,"changes":{"auto_rotate":false,"mic_mode":"off","auto_start_usb":true}}}));
     f.wait_for(|| f.request(json!("Status"))["phase"] == "streaming");
     let pid = f.request(json!("Status"))["pid"].as_u64().unwrap();
     unsafe {
@@ -449,13 +555,9 @@ case "$1" in
 esac
 "#);
     assert!(f.cli("status").status.success());
-    f.request(json!({"Start":{"serial":"z:5555","cfg":{
-        "auto_rotate":false,"mic_mode":"off",
-        "wireless_ip":"a:5555","history":[{
-            "serial":"z:5555","model":"Selected","address":"z:5555",
-            "is_wifi":true,"last_seen":""
-        }]
-    }}}));
+    f.request(json!({"WifiEndpoint":{"endpoint":"z:5555","model":"Selected","switch_from":null}}));
+    f.request(json!({"Configure":{"changes":{"auto_rotate":false,"mic_mode":"off","wireless_ip":"a:5555"}}}));
+    f.request(json!({"Start":{"serial":"z:5555","changes":{}}}));
     f.wait_for(|| fs::read_to_string(f.root.join("endpoints")).is_ok_and(|s| !s.is_empty()));
     assert_eq!(
         fs::read_to_string(f.root.join("endpoints")).unwrap(),
@@ -481,7 +583,7 @@ esac
 exec sleep 60
 "#,
     );
-    f.request(json!({"Start":{"serial":null,"cfg":{"auto_rotate":false,"mic_mode":"off"}}}));
+    f.request(json!({"Start":{"serial":null,"changes":{"auto_rotate":false,"mic_mode":"off"}}}));
     f.wait_for(|| {
         let s = f.request(json!("Status"));
         s["phase"] == "streaming" && s["cfg"]["resolution"] == "640x480"
