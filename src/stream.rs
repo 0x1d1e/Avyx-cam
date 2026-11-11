@@ -101,9 +101,8 @@ pub fn start_scrcpy(
         _ => args.push("--audio-source=mic-voice-recognition".to_string()),
     }
 
-    if !cfg.preview {
-        args.push("--no-window".to_string());
-    }
+    // Preview is rendered by GTK from the same virtual camera apps consume.
+    args.push("--no-window".to_string());
 
     let log_out = File::create(crate::session::runtime_dir()?.join("stream.log"))
         .map_err(|e| format!("Log file error: {e}"))?;

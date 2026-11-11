@@ -1,8 +1,10 @@
 mod battery;
+mod camera_frame;
 mod config;
 mod devices;
 #[cfg(test)]
 mod gui_tests;
+mod preview;
 mod process;
 mod qr;
 mod session;

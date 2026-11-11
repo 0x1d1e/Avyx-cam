@@ -299,5 +299,6 @@ esac
     reopened.close();
     pump(0.2);
     drop(_owner);
+    crate::preview::tests::exercise_clickable_preview(&app);
     fs::remove_dir_all(root).unwrap();
 }

@@ -189,6 +189,8 @@ pub fn build_ui(app: &adw::Application) {
         .build();
     warning_row.add_suffix(&fix_v4l2_inline_btn);
     status_group.add(&warning_row);
+    let camera_preview = Rc::new(crate::preview::CameraPreview::new());
+    status_group.add(camera_preview.widget());
     cam_page.add(&status_group);
 
     let battery_group = adw::PreferencesGroup::new();
@@ -323,8 +325,8 @@ pub fn build_ui(app: &adw::Application) {
     audio_group.add(&mic_row);
 
     let preview_row = adw::SwitchRow::builder()
-        .title("Show Live Preview Window")
-        .subtitle("Turn off for background webcam mode")
+        .title("Live Camera Preview")
+        .subtitle("Click QR links directly in the video")
         .active(state.borrow().cfg.preview)
         .build();
     audio_group.add(&preview_row);
@@ -587,6 +589,7 @@ pub fn build_ui(app: &adw::Application) {
         let torch_row_sync = torch_row.clone();
         let mic_row = mic_row.clone();
         let preview_row = preview_row.clone();
+        let camera_preview = camera_preview.clone();
         let bitrate_row = bitrate_row.clone();
         let buffer_row = buffer_row.clone();
         let auto_usb_row = auto_usb_row.clone();
@@ -789,6 +792,7 @@ pub fn build_ui(app: &adw::Application) {
             zoom_scale.set_value(cfg.zoom);
             torch_row_sync.set_active(cfg.torch);
             preview_row.set_active(cfg.preview);
+            camera_preview.set_session(state.borrow().session.pid, cfg.preview);
             auto_usb_row.set_active(cfg.auto_start_usb);
             auto_reconn_row.set_active(cfg.auto_reconnect);
             for (row, values, current) in [
@@ -1682,9 +1686,11 @@ pub fn build_ui(app: &adw::Application) {
 
     // The owner keeps supervising when this client closes.
     window.connect_close_request({
+        let camera_preview = camera_preview.clone();
         let closed = closed.clone();
         let poll_tick_holder = poll_tick_holder.clone();
         move |_| {
+            camera_preview.set_session(None, false);
             closed.store(true, Ordering::Relaxed);
             poll_tick_holder.borrow_mut().take();
             glib::Propagation::Proceed

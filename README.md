@@ -16,7 +16,8 @@ No Android app installation required. Uses native Android ADB media streaming vi
 - **High Frame Rates**: The GUI offers up to 120 fps on supported back cameras. Available modes and delivered frame rates depend on the phone.
 - **PipeWire Virtual Microphone**: Low-latency `PhoneMic` source selectable in Zoom, Google Meet, Discord, and OBS.
 - **Full Lens & Hardware Controls**: Front/back switch, zoom slider, flashlight/torch, flip/un-mirror, bitrate, and v4l2 buffering.
-- **Background Mode**: Disable live preview window to run purely as a headless system webcam.
+- **Live Preview with QR Links**: The Camera tab shows the live feed. QR codes containing http/https links are detected locally and highlighted. Click one to open it in your PC browser. Credentials in URLs and non-web schemes are ignored.
+- **Background Mode**: Disable live preview to run purely as a headless system webcam.
 - **CLI & GUI Modes**: Control completely through the GTK4 GUI or use command-line shortcuts (`avyx-cam back`, `avyx-cam stop`).
 
 ---

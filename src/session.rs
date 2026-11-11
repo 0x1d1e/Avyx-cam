@@ -168,7 +168,13 @@ pub fn request(request: Request) -> Result<Snapshot, String> {
 
 fn stream_settings(cfg: &AppConfig) -> serde_json::Value {
     let mut value = serde_json::to_value(cfg).unwrap();
-    for field in ["auto_reconnect", "auto_start_usb", "wireless_ip", "history"] {
+    for field in [
+        "auto_reconnect",
+        "auto_start_usb",
+        "wireless_ip",
+        "history",
+        "preview",
+    ] {
         value.as_object_mut().unwrap().remove(field);
     }
     value
