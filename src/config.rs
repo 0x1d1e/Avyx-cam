@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceHistory {
@@ -28,7 +27,7 @@ fn default_fps() -> String {
     "30".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
     pub camera_id: String,
@@ -80,12 +79,10 @@ impl AppConfig {
         is_wifi: bool,
         address: Option<&str>,
     ) {
-        let now = Command::new("date")
-            .args(["+%Y-%m-%d %H:%M"])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|| "Recently".to_string());
+        let now = gtk4::glib::DateTime::now_local()
+            .and_then(|date| date.format("%Y-%m-%d %H:%M"))
+            .map(|date| date.to_string())
+            .unwrap_or_else(|_| "Recently".to_string());
 
         let addr = address
             .unwrap_or(if is_wifi { serial } else { "" })
