@@ -35,6 +35,15 @@ done
 source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "$source_dir/Cargo.toml" && -f "$source_dir/Cargo.lock" ]] || fail 'Run this installer from a complete Avyx-cam source checkout'
 
+check_scrcpy() {
+    command -v scrcpy >/dev/null || fail 'Install current scrcpy first: https://github.com/Genymobile/scrcpy/blob/master/doc/linux.md . Then rerun this installer.'
+    local scrcpy_help option
+    scrcpy_help="$(scrcpy --help)" || fail 'Cannot query scrcpy capabilities'
+    for option in --video-source --camera-id --camera-fps --capture-orientation --v4l2-sink --audio-source; do
+        [[ "$scrcpy_help" == *"$option"* ]] || fail "scrcpy lacks $option. Install a current version: https://github.com/Genymobile/scrcpy/blob/master/doc/linux.md . Then rerun this installer."
+    done
+}
+
 if "$install_deps"; then
     command -v sudo >/dev/null || fail 'sudo is required for --install-deps'
     [[ -r /etc/os-release ]] || fail 'Cannot detect distribution; install dependencies manually'
@@ -45,13 +54,19 @@ if "$install_deps"; then
             sudo pacman -S --needed base-devel curl pkgconf gtk4 libadwaita android-tools scrcpy \
                 libpulse v4l2loopback-dkms v4l-utils polkit psmisc ;;
         *debian*|*ubuntu*)
+            # Stable distro scrcpy packages may lack camera/orientation support.
+            check_scrcpy
             sudo apt-get update
             sudo apt-get install build-essential curl pkg-config libgtk-4-dev libadwaita-1-dev \
-                adb scrcpy pulseaudio-utils v4l2loopback-dkms v4l-utils pkexec psmisc ;;
+                adb pulseaudio-utils v4l2loopback-dkms v4l-utils pkexec psmisc ;;
         *fedora*)
             command -v scrcpy >/dev/null || fail 'Install Fedora scrcpy first: sudo dnf copr enable zeno/scrcpy && sudo dnf install scrcpy. Then rerun this installer.'
+            check_scrcpy
+            if ! rpm -q akmod-v4l2loopback >/dev/null 2>&1; then
+                fail 'Install Fedora virtual-camera support first: enable RPM Fusion Free (https://rpmfusion.org/Configuration), then sudo dnf install akmod-v4l2loopback. Then rerun this installer.'
+            fi
             sudo dnf install gcc curl pkgconf-pkg-config gtk4-devel libadwaita-devel android-tools \
-                pulseaudio-utils v4l2loopback v4l-utils polkit psmisc ;;
+                pulseaudio-utils v4l-utils polkit psmisc ;;
         *) fail 'Unsupported package manager; install dependencies manually, then run ./install.sh' ;;
     esac
 fi
@@ -63,10 +78,7 @@ done
 ((${#missing[@]} == 0)) || fail "Missing commands: ${missing[*]}. Run ./install.sh --install-deps or install them manually."
 pkg-config --atleast-version=1.5 libadwaita-1 || fail 'libadwaita development files >= 1.5 are required'
 pkg-config --exists gtk4 || fail 'GTK4 development files are required'
-scrcpy_help="$(scrcpy --help)" || fail 'Cannot query scrcpy capabilities'
-for option in --video-source --camera-id --camera-fps --capture-orientation --v4l2-sink --audio-source; do
-    [[ "$scrcpy_help" == *"$option"* ]] || fail "scrcpy lacks $option. Install a current version: https://github.com/Genymobile/scrcpy/blob/master/doc/linux.md"
-done
+check_scrcpy
 
 cargo_command=(cargo)
 rustc_command=(rustc)

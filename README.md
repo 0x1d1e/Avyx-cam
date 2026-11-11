@@ -24,7 +24,7 @@ No Android app installation required. Uses native Android ADB media streaming vi
 
 ### Linux System Dependencies
 
-- **scrcpy** (>= 2.0 recommended)
+- **scrcpy** with camera capture and `--capture-orientation` support (use a current upstream release)
 - **android-tools** (`adb`)
 - **v4l2loopback** kernel module
 - **pipewire** / **pipewire-pulse**
@@ -36,14 +36,8 @@ sudo pacman -S scrcpy android-tools v4l2loopback-dkms libadwaita gtk4 qrencode
 ```
 
 #### Ubuntu / Debian / Fedora
-```bash
-# Ubuntu / Debian
-sudo apt install scrcpy adb v4l2loopback-dkms libadwaita-1-dev libgtk-4-dev qrencode
 
-# Fedora (enable the COPR repository for scrcpy first)
-sudo dnf copr enable zeno/scrcpy
-sudo dnf install scrcpy android-tools v4l2loopback libadwaita-devel gtk4-devel qrencode
-```
+These distributions need prerequisites before `./install.sh --install-deps`: Ubuntu/Debian need current upstream scrcpy; Fedora needs scrcpy from COPR and `akmod-v4l2loopback` from RPM Fusion Free. Follow the [distribution setup instructions](docs/installation.md#install). Ubuntu 24.04's packaged scrcpy is too old for camera streaming.
 
 ---
 
