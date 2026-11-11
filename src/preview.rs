@@ -12,7 +12,16 @@ use std::{
 };
 
 const MAX_AGE: Duration = Duration::from_millis(700);
+/// A QR that one frame fails to decode must not blink out of the overlay.
+const HOLD: Duration = Duration::from_millis(800);
 type OpenLink = Rc<dyn Fn(&str)>;
+
+#[derive(Clone)]
+struct Sighting {
+    url: String,
+    bounds: [(f64, f64); 4],
+    at: Instant,
+}
 
 struct View {
     root: gtk4::Box,
@@ -21,6 +30,9 @@ struct View {
     targets: gtk4::Fixed,
     hint: gtk4::Label,
     links: RefCell<Vec<(QrLink, gtk4::Button)>>,
+    /// Last sighting per URL: `(url, bounds, seen)`. Keeps targets steady across
+    /// frames where the decoder misses the code.
+    seen: RefCell<Vec<Sighting>>,
     frame_size: Cell<(usize, usize)>,
     allocation: Cell<(i32, i32)>,
     last_frame: Rc<Cell<Option<Instant>>>,
@@ -70,6 +82,7 @@ impl View {
         for (_, button) in self.links.borrow_mut().drain(..) {
             self.targets.remove(&button);
         }
+        self.seen.borrow_mut().clear();
         self.last_frame.set(None);
         self.hint.set_text(hint);
     }
@@ -101,7 +114,25 @@ impl View {
         self.picture.set_paintable(Some(&texture));
         let mut previous = self.links.take();
         let mut current = Vec::new();
-        for link in frame.links {
+        {
+            let mut seen = self.seen.borrow_mut();
+            for link in frame.links {
+                match seen.iter_mut().find(|entry| entry.url == link.url) {
+                    Some(entry) => {
+                        entry.bounds = link.bounds;
+                        entry.at = timestamp;
+                    }
+                    None => seen.push(Sighting {
+                        url: link.url.clone(),
+                        bounds: link.bounds,
+                        at: timestamp,
+                    }),
+                }
+            }
+            seen.retain(|entry| timestamp.saturating_duration_since(entry.at) <= HOLD);
+        }
+        for Sighting { url, bounds, .. } in self.seen.borrow().clone() {
+            let link = QrLink { url, bounds };
             let button =
                 if let Some(index) = previous.iter().position(|(old, _)| old.url == link.url) {
                     previous.remove(index).1
@@ -217,6 +248,7 @@ impl CameraPreview {
             hint,
             opener,
             links: RefCell::new(vec![]),
+            seen: RefCell::new(vec![]),
             frame_size: Cell::new((0, 0)),
             allocation: Cell::new((0, 0)),
             last_frame: Rc::new(Cell::new(None)),
@@ -437,11 +469,21 @@ pub(crate) mod tests {
         }
         preview.view.render(moved, Instant::now());
         assert_eq!(preview.view.links.borrow()[0].1, button);
-        preview.view.render(
-            crate::camera_frame::scan_rgb(640, 320, vec![255; 640 * 320 * 3]).unwrap(),
-            Instant::now(),
+        let blank = || crate::camera_frame::scan_rgb(640, 320, vec![255; 640 * 320 * 3]).unwrap();
+        let missed = Instant::now();
+        preview.view.render(blank(), missed);
+        assert_eq!(
+            preview.view.links.borrow()[0].1,
+            button,
+            "A single missed decode must not blink the target out"
         );
-        assert!(preview.view.links.borrow().is_empty());
+        preview
+            .view
+            .render(blank(), missed + HOLD + Duration::from_millis(1));
+        assert!(
+            preview.view.links.borrow().is_empty(),
+            "Targets disappear once the code is gone for longer than the hold window"
+        );
         button.emit_clicked();
         assert_eq!(
             opened.borrow().len(),

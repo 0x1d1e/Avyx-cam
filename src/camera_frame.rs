@@ -117,6 +117,10 @@ impl Layout {
         Ok(size)
     }
 
+    /// Downscale by area averaging. Point sampling aliases QR modules badly enough
+    /// that real camera frames stop decoding, so every destination pixel averages
+    /// its whole source box. Averaging happens in YUV before the one RGB
+    /// conversion, which keeps the cost near a single-tap fetch.
     fn convert(self, bytes: &[u8]) -> Result<Frame, String> {
         if bytes.len() < self.required()? {
             return Err("Incomplete camera frame".into());
@@ -130,67 +134,84 @@ impl Layout {
         let scale = (960.0 / w as f64).min(720.0 / h as f64).min(1.0);
         let width = ((w as f64 * scale) as usize).max(1);
         let height = ((h as f64 * scale) as usize).max(1);
+        let chroma_stride = s.div_ceil(2);
+        let chroma_plane = chroma_stride * h.div_ceil(2);
+        let packed = !matches!(&code, b"RGB3" | b"BGR3");
         let mut rgb = Vec::with_capacity(width * height * 3);
         for y in 0..height {
-            let sy = y * h / height;
+            let (y0, y1) = span(y, height, h);
             for x in 0..width {
-                let sx = x * w / width;
-                let color = match &code {
-                    b"RGB3" | b"BGR3" => {
-                        let p = sy * s + sx * 3;
-                        if code == *b"RGB3" {
-                            [bytes[p], bytes[p + 1], bytes[p + 2]]
-                        } else {
-                            [bytes[p + 2], bytes[p + 1], bytes[p]]
-                        }
-                    }
-                    _ => {
-                        let (luma, u, v) = match &code {
+                let (x0, x1) = span(x, width, w);
+                let mut sum = [0u32; 3];
+                let mut count = 0u32;
+                for sy in y0..y1 {
+                    for sx in x0..x1 {
+                        let pixel = match &code {
+                            b"RGB3" => {
+                                let p = sy * s + sx * 3;
+                                [bytes[p], bytes[p + 1], bytes[p + 2]]
+                            }
+                            b"BGR3" => {
+                                let p = sy * s + sx * 3;
+                                [bytes[p + 2], bytes[p + 1], bytes[p]]
+                            }
                             b"YU12" | b"YV12" => {
-                                let chroma_stride = s.div_ceil(2);
-                                let plane = chroma_stride * h.div_ceil(2);
                                 let p = s * h + (sy / 2) * chroma_stride + sx / 2;
                                 let (u, v) = if code == *b"YU12" {
-                                    (bytes[p], bytes[p + plane])
+                                    (bytes[p], bytes[p + chroma_plane])
                                 } else {
-                                    (bytes[p + plane], bytes[p])
+                                    (bytes[p + chroma_plane], bytes[p])
                                 };
-                                (bytes[sy * s + sx], u, v)
+                                [bytes[sy * s + sx], u, v]
                             }
                             b"NV12" | b"NV21" => {
                                 let p = s * h + (sy / 2) * s + (sx / 2) * 2;
-                                let (u, v) = if code == *b"NV12" {
-                                    (bytes[p], bytes[p + 1])
+                                if code == *b"NV12" {
+                                    [bytes[sy * s + sx], bytes[p], bytes[p + 1]]
                                 } else {
-                                    (bytes[p + 1], bytes[p])
-                                };
-                                (bytes[sy * s + sx], u, v)
+                                    [bytes[sy * s + sx], bytes[p + 1], bytes[p]]
+                                }
+                            }
+                            b"YUYV" => {
+                                let p = sy * s + (sx / 2) * 4;
+                                [bytes[p + (sx % 2) * 2], bytes[p + 1], bytes[p + 3]]
                             }
                             _ => {
                                 let p = sy * s + (sx / 2) * 4;
-                                if code == *b"YUYV" {
-                                    (bytes[p + (sx % 2) * 2], bytes[p + 1], bytes[p + 3])
-                                } else {
-                                    (bytes[p + 1 + (sx % 2) * 2], bytes[p], bytes[p + 2])
-                                }
+                                [bytes[p + 1 + (sx % 2) * 2], bytes[p], bytes[p + 2]]
                             }
                         };
-                        let c = (i32::from(luma) - 16).max(0);
-                        let d = i32::from(u) - 128;
-                        let e = i32::from(v) - 128;
-                        let clamp = |v: i32| ((v + 128) >> 8).clamp(0, 255) as u8;
-                        [
-                            clamp(298 * c + 409 * e),
-                            clamp(298 * c - 100 * d - 208 * e),
-                            clamp(298 * c + 516 * d),
-                        ]
+                        for (total, value) in sum.iter_mut().zip(pixel) {
+                            *total += u32::from(value);
+                        }
+                        count += 1;
                     }
-                };
-                rgb.extend_from_slice(&color);
+                }
+                let mean = |i: usize| (sum[i] / count) as u8;
+                if packed {
+                    let c = (i32::from(mean(0)) - 16).max(0);
+                    let d = i32::from(mean(1)) - 128;
+                    let e = i32::from(mean(2)) - 128;
+                    let clamp = |v: i32| ((v + 128) >> 8).clamp(0, 255) as u8;
+                    rgb.extend_from_slice(&[
+                        clamp(298 * c + 409 * e),
+                        clamp(298 * c - 100 * d - 208 * e),
+                        clamp(298 * c + 516 * d),
+                    ]);
+                } else {
+                    rgb.extend_from_slice(&[mean(0), mean(1), mean(2)]);
+                }
             }
         }
         scan_rgb(width, height, rgb)
     }
+}
+
+/// Destination pixel `i` of `n` maps to the source range it must average.
+fn span(i: usize, n: usize, source: usize) -> (usize, usize) {
+    let start = (i * source / n).min(source.saturating_sub(1));
+    let end = (((i + 1) * source).div_ceil(n)).min(source).max(start + 1);
+    (start, end.min(source))
 }
 
 /// Reads frames with the mmap streaming API. `read()` I/O on v4l2loopback holds
